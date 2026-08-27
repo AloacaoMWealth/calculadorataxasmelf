@@ -840,7 +840,7 @@ def export_excel(registry, groups, detail, summary, diagnostics, coverage, accou
 # ----------------------------- UI -----------------------------
 icon_path = find_icon_path()
 page_icon = Image.open(icon_path) if icon_path else "M"
-st.set_page_config(page_title="Cálculo de Fee | M Wealth", page_icon=page_icon, layout="wide")
+st.set_page_config(page_title="Calculadora Fee | M Wealth", page_icon=page_icon, layout="wide")
 
 st.markdown("""
 <style>

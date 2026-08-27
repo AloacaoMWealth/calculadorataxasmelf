@@ -11,6 +11,7 @@ from typing import Iterable, Optional
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image
 
 # ============================================================
 # M WEALTH - MOTOR DE FEE
@@ -32,6 +33,7 @@ CONTROL_CANDIDATES = [
     APP_DIR / "Controle de Clientes MWealth 2026.xlsx",
 ]
 NO_FEE_LABELS = {"SEM COBRANÇA", "SEM COBRANCA", "NÃO COBRAR", "NAO COBRAR"}
+ICON_CANDIDATES = [APP_DIR / "M_light.png", APP_DIR / "M light.png"]
 
 
 def norm_text(v) -> str:
@@ -234,7 +236,7 @@ def fixed_rate_from_label(label: str) -> Optional[float]:
 def lookup_fee_rate(table_label: str, group_pl_brl: float, fee_tables) -> tuple[Optional[float], str]:
     fixed = fixed_rate_from_label(table_label)
     if fixed is not None:
-        return fixed, "Taxa fixa/sem cobrança"
+        return fixed, "Sem cobrança" if fixed == 0 else "Taxa fixa"
 
     candidates = [table_label, table_label.upper(), table_label.strip(), table_label.strip().upper()]
     rows = None
@@ -476,132 +478,391 @@ def build_monthly_from_control(registry: pd.DataFrame, ctrl: pd.DataFrame, pl_co
     }
     return out, meta
 
-def calculate_fees(mov: pd.DataFrame, registry: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def calculate_fees(mov: pd.DataFrame, registry: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Calcula somente contas casadas com o Controle.
+
+    Contas extras das fontes nunca entram na cobrança; o diagnóstico de cadastro
+    é produzido separadamente por build_match_diagnostics().
+    """
     if mov.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    reg = registry[["Conta_norm", "Corretora", "Grupo_chave", "Grupo Familiar", "Cliente", "Tabela Fee",
-                    "PL_ref_BRL", "PL_Grupo_Ref_BRL", "Participacao_no_Grupo", "Fee_aa"]].copy()
-    out = mov.merge(reg, on=["Conta_norm", "Corretora"], how="left", indicator=True)
-    out["Status_Match"] = out["_merge"].map({"both": "OK", "left_only": "Conta não encontrada no Controle", "right_only": ""})
-    out = out.drop(columns=["_merge"])
+        return pd.DataFrame(), pd.DataFrame()
+
+    reg = registry[[
+        "Conta_norm", "Corretora", "Grupo_chave", "Grupo Familiar", "Cliente", "Tabela Fee",
+        "PL_ref_BRL", "PL_Grupo_Ref_BRL", "Participacao_no_Grupo", "Fee_aa", "Regra_Fee"
+    ]].copy()
+
+    out = mov.merge(reg, on=["Conta_norm", "Corretora"], how="inner")
+    if out.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
     out["Fee_Calculado"] = 0.0
     daily = out["Metodo"].eq("Diário / 252")
     monthly = out["Metodo"].str.startswith("Mensal / 12", na=False)
     out.loc[daily, "Fee_Calculado"] = out.loc[daily, "PL_BRL"] * out.loc[daily, "Fee_aa"].fillna(0) / 252
     out.loc[monthly, "Fee_Calculado"] = out.loc[monthly, "PL_BRL"] * out.loc[monthly, "Fee_aa"].fillna(0) / 12
 
+    out = out.sort_values(["Corretora", "Conta_norm", "Data"]).reset_index(drop=True)
+
     summary = (
-        out.groupby(["Corretora", "Conta_norm", "Grupo_chave", "Cliente", "Tabela Fee", "Fee_aa", "Metodo"], dropna=False)
-           .agg(PL_Medio_BRL=("PL_BRL", "mean"),
-                PL_Fechamento_BRL=("PL_BRL", "last"),
-                Dias_ou_Registros=("Data", "nunique"),
-                Fee_Mes=("Fee_Calculado", "sum"),
-                Data_Inicial=("Data", "min"),
-                Data_Final=("Data", "max"))
-           .reset_index()
+        out.groupby([
+            "Corretora", "Conta_norm", "Grupo_chave", "Cliente", "Tabela Fee", "Fee_aa", "Regra_Fee", "Metodo", "Moeda"
+        ], dropna=False)
+        .agg(
+            PL_Medio_Original=("PL_original", "mean"),
+            PL_Fechamento_Original=("PL_original", "last"),
+            PL_Medio_BRL=("PL_BRL", "mean"),
+            PL_Fechamento_BRL=("PL_BRL", "last"),
+            Dias_ou_Registros=("Data", "nunique"),
+            Fee_Mes=("Fee_Calculado", "sum"),
+            Data_Inicial=("Data", "min"),
+            Data_Final=("Data", "max"),
+        )
+        .reset_index()
     )
+    summary["PL_Medio_USD"] = summary["PL_Medio_Original"].where(summary["Moeda"].eq("USD"))
+    summary["PL_Fechamento_USD"] = summary["PL_Fechamento_Original"].where(summary["Moeda"].eq("USD"))
     summary["Fee_Projetado_Anual_sobre_PL_Medio"] = summary["PL_Medio_BRL"] * summary["Fee_aa"].fillna(0)
-
-    unmatched = out[out["Status_Match"] != "OK"][["Corretora", "Conta_norm", "Data", "PL_BRL", "Status_Match"]].drop_duplicates()
-    return out, summary, unmatched
+    return out, summary
 
 
-def expected_business_days(year: int, month: int, until: Optional[date] = None) -> int:
-    start, end = month_bounds(year, month)
-    if until:
-        end = min(end, pd.Timestamp(until))
-    return len(pd.bdate_range(start, end))
+def build_match_diagnostics(mov: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
+    """Diagnóstico objetivo de cadastro para XP e BTG.
+
+    - PL -> Controle: conta apareceu na fonte e não existe no Controle.
+    - Controle -> PL: conta existe no Controle e não apareceu em nenhuma posição carregada da corretora.
+    - Charles Schwab extra é ignorada integralmente, conforme regra operacional.
+    """
+    rows = []
+    for broker in ["XP", "BTG"]:
+        src = mov[mov["Corretora"].eq(broker)].copy()
+        if src.empty:
+            continue
+        reg = registry[registry["Corretora"].eq(broker)].copy()
+        source_accounts = set(src["Conta_norm"].dropna().astype(str)) - {""}
+        control_accounts = set(reg["Conta_norm"].dropna().astype(str)) - {""}
+
+        for account in sorted(source_accounts - control_accounts):
+            ss = src[src["Conta_norm"].eq(account)]
+            dates = sorted(pd.to_datetime(ss["Data"].dropna()).dt.date.unique())
+            rows.append({
+                "Corretora": broker,
+                "Conta": account,
+                "Cliente": "",
+                "Grupo Familiar": "",
+                "Problema": "Está no arquivo de PL, mas não está no Controle",
+                "Origem": "PL → Controle",
+                "Registros": int(len(ss)),
+                "Primeira Data": pd.Timestamp(min(dates)) if dates else pd.NaT,
+                "Última Data": pd.Timestamp(max(dates)) if dates else pd.NaT,
+            })
+
+        missing = reg[reg["Conta_norm"].isin(control_accounts - source_accounts)].copy()
+        for _, r in missing.iterrows():
+            rows.append({
+                "Corretora": broker,
+                "Conta": r["Conta_norm"],
+                "Cliente": r["Cliente"],
+                "Grupo Familiar": r["Grupo_chave"],
+                "Problema": "Está no Controle, mas não apareceu no arquivo de PL",
+                "Origem": "Controle → PL",
+                "Registros": 0,
+                "Primeira Data": pd.NaT,
+                "Última Data": pd.NaT,
+            })
+    return pd.DataFrame(rows)
 
 
-def export_excel(registry, groups, detail, summary, unmatched, year, month) -> bytes:
+def build_coverage(mov: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+    rows = []
+    start, month_end = month_bounds(year, month)
+    today = pd.Timestamp(date.today())
+    if month_end < today.normalize():
+        expected_end = month_end
+    elif start <= today.normalize() <= month_end:
+        expected_end = today.normalize()
+    else:
+        expected_end = month_end
+
+    expected_dates = list(pd.bdate_range(start, expected_end).date)
+    for broker in ["XP", "BTG", "CHARLES SCHWAB"]:
+        sub = mov[mov["Corretora"].eq(broker)]
+        if sub.empty:
+            continue
+        found_dates = sorted(pd.to_datetime(sub["Data"].dropna()).dt.date.unique())
+        found_set = set(found_dates)
+        missing = [d for d in expected_dates if d not in found_set]
+        rows.append({
+            "Corretora": broker,
+            "Primeira Data": pd.Timestamp(min(found_dates)) if found_dates else pd.NaT,
+            "Última Data": pd.Timestamp(max(found_dates)) if found_dates else pd.NaT,
+            "Dias Encontrados": len(found_dates),
+            "Dias Úteis Esperados": len(expected_dates),
+            "Cobertura": len(found_dates) / len(expected_dates) if expected_dates else 0,
+            "Datas Ausentes": ", ".join(d.strftime("%d/%m/%Y") for d in missing) if missing else "Nenhuma",
+        })
+    return pd.DataFrame(rows)
+
+
+def build_account_fee_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary.empty:
+        return pd.DataFrame()
+    return (
+        summary.groupby(["Corretora", "Conta_norm", "Cliente", "Grupo_chave", "Fee_aa", "Regra_Fee"], dropna=False)
+        .agg(Fee_Total=("Fee_Mes", "sum"), PL_Base_BRL=("PL_Medio_BRL", "mean"))
+        .reset_index()
+        .sort_values(["Corretora", "Cliente", "Conta_norm"])
+    )
+
+
+def find_icon_path() -> Optional[Path]:
+    for p in ICON_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def parse_manual_ptax(text: str) -> dict[date, float]:
+    manual = {}
+    if not text:
+        return manual
+    for item in re.split(r"\s*\|\s*|\n+", text.strip()):
+        if ";" not in item:
+            continue
+        ds, vs = item.split(";", 1)
+        try:
+            cleaned = vs.strip().replace(" ", "")
+            if "," in cleaned:
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            manual[datetime.strptime(ds.strip(), "%d/%m/%Y").date()] = float(cleaned)
+        except Exception:
+            continue
+    return manual
+
+
+def fmt_brl(v) -> str:
+    if pd.isna(v):
+        return "—"
+    return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_usd(v) -> str:
+    if pd.isna(v):
+        return "—"
+    return f"$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_pct(v, decimals=2) -> str:
+    if pd.isna(v):
+        return "—"
+    return f"{float(v) * 100:.{decimals}f}%".replace(".", ",")
+
+
+def registry_display(registry: pd.DataFrame) -> pd.DataFrame:
+    d = registry.copy()
+    d["PL Referência USD"] = d["PL_ref_original"].where(d["Moeda_ref"].eq("USD")).map(fmt_usd)
+    d["PL Referência BRL"] = d["PL_ref_BRL"].map(fmt_brl)
+    d["PL Grupo Familiar"] = d["PL_Grupo_Ref_BRL"].map(fmt_brl)
+    d["Participação"] = d["Participacao_no_Grupo"].map(fmt_pct)
+    d["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
+    d["Fee Mensal Teórico"] = d["Fee_Projetado_Mensal_Ref"].map(fmt_brl)
+    return d.rename(columns={
+        "Grupo_chave": "Grupo Familiar", "Conta_norm": "Conta", "Tabela Fee": "Tabela",
+        "Regra_Fee": "Regra do Fee", "Corretora": "Corretora", "Cliente": "Cliente"
+    })[["Grupo Familiar", "Cliente", "Corretora", "Conta", "Tabela", "Regra do Fee",
+        "PL Referência USD", "PL Referência BRL", "PL Grupo Familiar", "Participação", "Fee a.a.", "Fee Mensal Teórico"]]
+
+
+def summary_display(summary: pd.DataFrame) -> pd.DataFrame:
+    d = summary.copy()
+    d["PL Médio USD"] = d["PL_Medio_USD"].map(fmt_usd)
+    d["PL Médio BRL"] = d["PL_Medio_BRL"].map(fmt_brl)
+    d["PL Fechamento USD"] = d["PL_Fechamento_USD"].map(fmt_usd)
+    d["PL Fechamento BRL"] = d["PL_Fechamento_BRL"].map(fmt_brl)
+    d["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
+    d["Fee do Mês"] = d["Fee_Mes"].map(fmt_brl)
+    d["Período"] = d["Data_Inicial"].dt.strftime("%d/%m/%Y") + " a " + d["Data_Final"].dt.strftime("%d/%m/%Y")
+    return d.rename(columns={
+        "Grupo_chave": "Grupo Familiar", "Conta_norm": "Conta", "Tabela Fee": "Tabela",
+        "Regra_Fee": "Regra do Fee", "Metodo": "Metodologia", "Dias_ou_Registros": "Dias/Registros"
+    })[["Grupo Familiar", "Cliente", "Corretora", "Conta", "Tabela", "Regra do Fee", "Metodologia",
+        "PL Médio USD", "PL Médio BRL", "PL Fechamento USD", "PL Fechamento BRL", "Fee a.a.", "Dias/Registros", "Fee do Mês", "Período"]]
+
+
+def diagnostics_display(diag: pd.DataFrame) -> pd.DataFrame:
+    if diag.empty:
+        return diag
+    d = diag.copy()
+    d["Primeira Data"] = pd.to_datetime(d["Primeira Data"]).dt.strftime("%d/%m/%Y").fillna("—")
+    d["Última Data"] = pd.to_datetime(d["Última Data"]).dt.strftime("%d/%m/%Y").fillna("—")
+    return d[["Corretora", "Conta", "Cliente", "Grupo Familiar", "Origem", "Problema", "Registros", "Primeira Data", "Última Data"]]
+
+
+def coverage_display(cov: pd.DataFrame) -> pd.DataFrame:
+    if cov.empty:
+        return cov
+    d = cov.copy()
+    d["Primeira Data"] = pd.to_datetime(d["Primeira Data"]).dt.strftime("%d/%m/%Y")
+    d["Última Data"] = pd.to_datetime(d["Última Data"]).dt.strftime("%d/%m/%Y")
+    d["Cobertura"] = d["Cobertura"].map(fmt_pct)
+    return d
+
+
+def _pretty_export_frames(registry, groups, detail, summary, diagnostics, coverage, account_summary):
+    reg = registry.copy().rename(columns={
+        "Grupo_chave": "Grupo Familiar (Chave)", "Conta_norm": "Conta", "Tabela Fee": "Tabela Fee",
+        "PL_ref_original": "PL Referência Original", "Moeda_ref": "Moeda", "PTAX_ref": "PTAX Referência",
+        "PL_ref_BRL": "PL Referência BRL", "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL",
+        "Participacao_no_Grupo": "Participação no Grupo", "Fee_aa": "Fee a.a.", "Regra_Fee": "Regra do Fee",
+        "Fee_Projetado_Mensal_Ref": "Fee Mensal Teórico"
+    })
+    reg["PL Referência USD"] = reg["PL Referência Original"].where(reg["Moeda"].eq("USD"))
+
+    grp = groups.copy().rename(columns={
+        "Grupo_chave": "Grupo Familiar", "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL", "Contas": "Contas",
+        "Fee_Projetado_Anual": "Fee Projetado Anual", "ROA_Contratado": "ROA Contratado",
+        "Data_Referencia": "Data de Referência", "PTAX_Referencia": "PTAX Referência",
+        "Data_PTAX_Utilizada": "Data PTAX Utilizada", "Fonte_PTAX": "Fonte PTAX"
+    })
+
+    summ = summary.copy().rename(columns={
+        "Conta_norm": "Conta", "Grupo_chave": "Grupo Familiar", "Tabela Fee": "Tabela Fee", "Fee_aa": "Fee a.a.",
+        "Regra_Fee": "Regra do Fee", "Metodo": "Metodologia", "PL_Medio_Original": "PL Médio Original",
+        "PL_Fechamento_Original": "PL Fechamento Original", "PL_Medio_BRL": "PL Médio BRL",
+        "PL_Fechamento_BRL": "PL Fechamento BRL", "Dias_ou_Registros": "Dias/Registros", "Fee_Mes": "Fee do Mês",
+        "Data_Inicial": "Data Inicial", "Data_Final": "Data Final", "PL_Medio_USD": "PL Médio USD",
+        "PL_Fechamento_USD": "PL Fechamento USD", "Fee_Projetado_Anual_sobre_PL_Medio": "Fee Anual sobre PL Médio"
+    })
+
+    det = detail.copy().rename(columns={
+        "Conta_norm": "Conta", "PL_original": "PL Original", "PL_BRL": "PL BRL", "Metodo": "Metodologia",
+        "Grupo_chave": "Grupo Familiar", "Tabela Fee": "Tabela Fee", "PL_ref_BRL": "PL Referência BRL",
+        "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL", "Participacao_no_Grupo": "Participação no Grupo",
+        "Fee_aa": "Fee a.a.", "Regra_Fee": "Regra do Fee", "Fee_Calculado": "Fee Calculado"
+    })
+    det["PL USD"] = det["PL Original"].where(det["Moeda"].eq("USD"))
+
+    acct = account_summary.copy().rename(columns={
+        "Conta_norm": "Conta", "Grupo_chave": "Grupo Familiar", "Fee_aa": "Fee a.a.", "Regra_Fee": "Regra do Fee",
+        "Fee_Total": "Fee Total", "PL_Base_BRL": "PL Base BRL"
+    })
+    return reg, grp, summ, det, diagnostics.copy(), coverage.copy(), acct
+
+
+def export_excel(registry, groups, detail, summary, diagnostics, coverage, account_summary, year, month) -> bytes:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as writer:
-        registry.to_excel(writer, sheet_name="Cadastro Fee", index=False)
-        groups.to_excel(writer, sheet_name="Grupos", index=False)
-        if not summary.empty:
-            summary.to_excel(writer, sheet_name="Resumo Cobranca", index=False)
-        if not detail.empty:
-            detail.to_excel(writer, sheet_name="Memoria Calculo", index=False)
-            daily_detail = detail[detail["Metodo"].eq("Diário / 252")].copy()
-            monthly_detail = detail[detail["Metodo"].str.startswith("Mensal / 12", na=False)].copy()
-            if not daily_detail.empty:
-                daily_detail.to_excel(writer, sheet_name="Calculo Diario", index=False)
-            if not monthly_detail.empty:
-                monthly_detail.to_excel(writer, sheet_name="Calculo Mensal", index=False)
-            for broker in sorted(detail["Corretora"].dropna().unique()):
-                safe = re.sub(r"[^A-Za-z0-9 _-]", "", broker)[:22]
-                detail[detail["Corretora"] == broker].to_excel(writer, sheet_name=f"Calc {safe}"[:31], index=False)
-        if not unmatched.empty:
-            unmatched.to_excel(writer, sheet_name="Pendencias Match", index=False)
+    reg, grp, summ, det, diag, cov, acct = _pretty_export_frames(
+        registry, groups, detail, summary, diagnostics, coverage, account_summary
+    )
+    daily = det[det["Metodologia"].eq("Diário / 252")].copy() if not det.empty else pd.DataFrame()
+    monthly = det[det["Metodologia"].str.startswith("Mensal / 12", na=False)].copy() if not det.empty else pd.DataFrame()
 
-        # Formatação enxuta e financeira
+    datasets = {
+        "Resumo por Conta": acct,
+        "Resumo Cobranca": summ,
+        "Cadastro Fee": reg,
+        "Grupos": grp,
+        "Cobertura Diaria": cov,
+        "Pendencias Cadastro": diag,
+        "Memoria Calculo": det,
+        "Calculo Diario": daily,
+        "Calculo Mensal": monthly,
+    }
+    if not det.empty:
+        for broker in sorted(det["Corretora"].dropna().unique()):
+            safe = re.sub(r"[^A-Za-z0-9 _-]", "", broker)[:22]
+            datasets[f"Calc {safe}"[:31]] = det[det["Corretora"].eq(broker)].copy()
+
+    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as writer:
+        for sname, data in datasets.items():
+            if data is not None and not data.empty:
+                data.to_excel(writer, sheet_name=sname, index=False)
+
         wb = writer.book
-        fmt_money = wb.add_format({"num_format": 'R$ #,##0.00;[Red](R$ #,##0.00);-'})
-        fmt_pct = wb.add_format({"num_format": '0.00%;[Red](0.00%);-'})
-        fmt_hdr = wb.add_format({"bold": True, "bg_color": "#141C24", "font_color": "#FFFFFF", "border": 0})
-        for sheet_name, ws in writer.sheets.items():
-            ws.hide_gridlines(2)
-            # Cabeçalho
-            if sheet_name in ["Cadastro Fee", "Grupos", "Resumo Cobranca", "Memoria Calculo", "Calculo Diario", "Calculo Mensal", "Pendencias Match"] or sheet_name.startswith("Calc "):
-                # largura genérica
-                ws.set_row(0, 22, fmt_hdr)
-                ws.freeze_panes(1, 0)
-                ws.autofilter(0, 0, max(1, ws.dim_rowmax), max(0, ws.dim_colmax))
-                ws.set_column(0, max(0, ws.dim_colmax), 17)
-        # formatos por busca de nomes de coluna
-        datasets = {
-            "Cadastro Fee": registry, "Grupos": groups, "Resumo Cobranca": summary,
-            "Memoria Calculo": detail,
-            "Calculo Diario": detail[detail["Metodo"].eq("Diário / 252")].copy() if not detail.empty else pd.DataFrame(),
-            "Calculo Mensal": detail[detail["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not detail.empty else pd.DataFrame(),
-            "Pendencias Match": unmatched
-        }
+        fmt_header = wb.add_format({"bold": True, "bg_color": "#141C24", "font_color": "#FFFFFF", "border": 0, "align": "center", "valign": "vcenter"})
+        fmt_brl_x = wb.add_format({"num_format": 'R$ #,##0.00;[Red](R$ #,##0.00);-'})
+        fmt_usd_x = wb.add_format({"num_format": '$ #,##0.00;[Red]($ #,##0.00);-'})
+        fmt_pct_x = wb.add_format({"num_format": '0.000%;[Red](0.000%);-'})
+        fmt_ptax = wb.add_format({"num_format": '0.0000'})
+        fmt_int = wb.add_format({"num_format": '#,##0'})
+
         for sname, data in datasets.items():
             if sname not in writer.sheets or data is None or data.empty:
                 continue
             ws = writer.sheets[sname]
-            for idx, col in enumerate(data.columns):
-                if any(k in str(col) for k in ["PL_", "Fee_"]) and "Fee_aa" not in str(col):
-                    ws.set_column(idx, idx, 18, fmt_money)
-                if col in ["Fee_aa", "Participacao_no_Grupo", "ROA_Contratado"]:
-                    ws.set_column(idx, idx, 16, fmt_pct)
-                if "Cliente" in str(col) or "Grupo" in str(col):
-                    ws.set_column(idx, idx, 28)
+            ws.hide_gridlines(2)
+            ws.freeze_panes(1, 0)
+            ws.set_row(0, 24, fmt_header)
+            ws.autofilter(0, 0, len(data), len(data.columns)-1)
+            for i, col in enumerate(data.columns):
+                name = str(col)
+                width = 16
+                fmt = None
+                if "Cliente" in name or "Grupo Familiar" in name or "Problema" in name or "Datas Ausentes" in name:
+                    width = 30 if "Datas Ausentes" not in name else 55
+                elif "Corretora" in name or "Metodologia" in name or "Regra" in name or "Tabela" in name:
+                    width = 20
+                elif "Data" in name or name == "Período":
+                    width = 15
+                elif "Conta" in name:
+                    width = 15
+                if "USD" in name or ("Original" in name and "Moeda" in data.columns):
+                    fmt = fmt_usd_x if "USD" in name else None
+                if "BRL" in name or name.startswith("Fee ") or name in {"Fee Total", "Fee Calculado", "Fee do Mês", "Fee Mensal Teórico", "Fee Projetado Anual", "Fee Anual sobre PL Médio"}:
+                    fmt = fmt_brl_x
+                if "%" in name or name in {"Fee a.a.", "ROA Contratado", "Participação no Grupo", "Cobertura"}:
+                    fmt = fmt_pct_x
+                if "PTAX" in name:
+                    fmt = fmt_ptax
+                if name in {"Contas", "Registros", "Dias/Registros", "Dias Encontrados", "Dias Úteis Esperados"}:
+                    fmt = fmt_int
+                ws.set_column(i, i, width, fmt)
     return output.getvalue()
 
 
 # ----------------------------- UI -----------------------------
-# ----------------------------- UI -----------------------------
-st.set_page_config(page_title="Cálculo de Fee | M Wealth", layout="wide")
+icon_path = find_icon_path()
+page_icon = Image.open(icon_path) if icon_path else "M"
+st.set_page_config(page_title="Cálculo de Fee | M Wealth", page_icon=page_icon, layout="wide")
+
+st.markdown("""
+<style>
+    .block-container {padding-top: 2.0rem; padding-bottom: 3rem; max-width: 1500px;}
+    h1 {font-size: 2rem !important; margin-bottom: .35rem !important;}
+    h2, h3 {letter-spacing: -0.02em;}
+    div[data-testid="stMetric"] {
+        background: rgba(255,255,255,0.035);
+        border: 1px solid rgba(128,128,128,0.18);
+        padding: 14px 16px;
+        border-radius: 12px;
+        min-height: 105px;
+    }
+    div[data-testid="stMetricLabel"] {font-size: .82rem; opacity: .72;}
+    div[data-testid="stMetricValue"] {font-size: 1.35rem;}
+    div[data-testid="stFileUploader"] {border-radius: 12px;}
+    .small-note {font-size: .82rem; opacity: .68; margin-top: -6px;}
+    .section-gap {height: .35rem;}
+    [data-testid="stDataFrame"] {border: 1px solid rgba(128,128,128,.16); border-radius: 10px; overflow: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("Cálculo de Fee Mensal — M Wealth")
-st.caption("Faixa pelo PL do grupo familiar · diário/252 · Safra e XP US pelo Controle · offshore por PTAX")
 
-with st.sidebar:
-    st.header("Período")
-    today = date.today()
-    year = st.number_input("Ano da cobrança", min_value=2024, max_value=2100, value=today.year, step=1)
-    month = st.number_input("Mês da cobrança", min_value=1, max_value=12, value=today.month, step=1)
-    st.divider()
-    st.subheader("PTAX manual (opcional)")
-    st.caption("Use apenas se quiser travar uma cotação. Formato: DD/MM/AAAA;5,0770")
-    ptax_text = st.text_area("Cotações", value="", height=100, label_visibility="collapsed")
-
-manual_ptax = {}
-for line in ptax_text.splitlines():
-    if ";" not in line:
-        continue
-    ds, vs = line.split(";", 1)
-    try:
-        cleaned = vs.strip().replace(" ", "")
-        if "," in cleaned:
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        manual_ptax[datetime.strptime(ds.strip(), "%d/%m/%Y").date()] = float(cleaned)
-    except Exception:
-        pass
+today = date.today()
+month_names = {1:"Janeiro",2:"Fevereiro",3:"Março",4:"Abril",5:"Maio",6:"Junho",7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
+sel1, sel2, sel3, spacer = st.columns([1.0, 1.25, 3.1, 4.65])
+with sel1:
+    year = st.selectbox("Ano", list(range(today.year-2, today.year+3)), index=2)
+with sel2:
+    month_name = st.selectbox("Mês", list(month_names.values()), index=today.month-1)
+    month = next(k for k,v in month_names.items() if v == month_name)
+with sel3:
+    ptax_text = st.text_input("PTAX manual · opcional", placeholder="31/07/2026;5,0770")
+manual_ptax = parse_manual_ptax(ptax_text)
 
 control_path = find_fixed_control_path()
 if control_path is None:
-    st.error("Base fixa não encontrada. Inclua data/controle_clientes.xlsx no projeto.")
+    st.error("Base fixa não encontrada. Mantenha 'Controle de Clientes MWealth 2026.xlsx' na raiz do projeto.")
     st.stop()
 
 try:
@@ -615,32 +876,22 @@ except Exception as e:
 latest_pl_date = max(datetime.strptime(c[3:], "%d/%m/%Y").date() for c in pl_cols)
 accounts_count = int(ctrl["Conta_norm"].ne("").sum())
 groups_count = int(ctrl["Grupo Familiar"].where(ctrl["Grupo Familiar"].ne(""), ctrl["Cliente"]).nunique())
-
-st.subheader("Base cadastral")
-b1, b2, b3, b4 = st.columns(4)
-b1.metric("Base", "Controle de Clientes")
-b2.metric("Último PL na base", latest_pl_date.strftime("%d/%m/%Y"))
-b3.metric("Contas cadastradas", f"{accounts_count:,}".replace(",", "."))
-b4.metric("Grupos familiares", f"{groups_count:,}".replace(",", "."))
-st.caption(f"Arquivo fixo carregado automaticamente: {control_path.name}. Para atualizar cadastros ou PLs, substitua esse arquivo no projeto.")
-
-# Indicadores de referência / faixa
-st.subheader("Faixa e fee contratado")
 total_pl = registry["PL_ref_BRL"].sum()
 fee_ann = registry["Fee_Projetado_Mensal_Ref"].sum() * 12
 roa = fee_ann / total_pl if total_pl else 0
-r1, r2, r3, r4 = st.columns(4)
-r1.metric("PL de referência", f"R$ {total_pl:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-r2.metric("Data referência", ref_date.strftime("%d/%m/%Y"))
-r3.metric("ROA médio contratado", f"{roa:.3%}")
-r4.metric("Fee mensal teórico", f"R$ {fee_ann/12:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-st.caption("A faixa de fee usa o PL consolidado do grupo familiar no fechamento anterior ao mês da cobrança.")
 
-with st.expander("Ver cadastro de fee e segmentação"):
-    st.dataframe(
-        registry[["Grupo_chave", "Cliente", "Corretora", "Conta_norm", "Tabela Fee", "PL_ref_BRL", "PL_Grupo_Ref_BRL", "Participacao_no_Grupo", "Fee_aa", "Regra_Fee"]],
-        use_container_width=True, hide_index=True,
-    )
+st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+st.subheader("Visão geral")
+r1, r2, r3, r4, r5 = st.columns(5)
+r1.metric("PL de referência", fmt_brl(total_pl))
+r2.metric("ROA médio contratado", fmt_pct(roa, 3))
+r3.metric("Fee mensal teórico", fmt_brl(fee_ann/12))
+r4.metric("Contas cadastradas", f"{accounts_count:,}".replace(",", "."))
+r5.metric("Grupos familiares", f"{groups_count:,}".replace(",", "."))
+st.markdown(f'<div class="small-note">Referência da faixa: {ref_date:%d/%m/%Y} · Último PL disponível no Controle: {latest_pl_date:%d/%m/%Y}</div>', unsafe_allow_html=True)
+
+with st.expander("Cadastro de fee e segmentação", expanded=False):
+    st.dataframe(registry_display(registry), use_container_width=True, hide_index=True, height=420)
 
 st.subheader("Arquivos operacionais do mês")
 st.caption("Safra e XP US não precisam de upload: o PL mensal é lido diretamente do Controle de Clientes.")
@@ -652,18 +903,12 @@ with c2:
 with c3:
     cs_files = st.file_uploader("Charles Schwab — um CSV por dia", type=["csv"], accept_multiple_files=True, key="cs")
 
-# Mostra previamente qual posição mensal será usada no Controle.
 monthly_preview = None
 monthly_meta = None
 try:
     monthly_preview, monthly_meta = build_monthly_from_control(registry, ctrl, pl_cols, int(year), int(month), manual_ptax)
-    label = "Fechamento" if monthly_meta["is_close"] else "Prévia"
-    st.info(
-        f"Safra/XP US: {label} usando {monthly_meta['billing_col']} como PL mensal. "
-        + (f"XP US convertido pela PTAX da posição ({monthly_meta['billing_date']:%d/%m/%Y})." if (monthly_preview["Corretora"] == "XP US").any() else "")
-    )
-except Exception as e:
-    st.warning(f"Safra/XP US ainda não serão calculados: {e}")
+except Exception:
+    monthly_preview = None
 
 if st.button("Calcular cobrança", type="primary", use_container_width=True):
     parts = []
@@ -694,69 +939,81 @@ if st.button("Calcular cobrança", type="primary", use_container_width=True):
         st.warning("Nenhum PL válido foi encontrado para o período.")
     else:
         mov = pd.concat(valid, ignore_index=True)
-        detail, summary, unmatched = calculate_fees(mov, registry)
+        diagnostics = build_match_diagnostics(mov, registry)
+        coverage = build_coverage(mov[mov["Metodo"].eq("Diário / 252")].copy(), int(year), int(month))
+        detail, summary = calculate_fees(mov, registry)
+        account_summary = build_account_fee_summary(summary)
 
-        daily_detail = detail[detail["Metodo"].eq("Diário / 252")].copy()
-        monthly_detail = detail[detail["Metodo"].str.startswith("Mensal / 12", na=False)].copy()
-        daily_summary = summary[summary["Metodo"].eq("Diário / 252")].copy()
-        monthly_summary = summary[summary["Metodo"].str.startswith("Mensal / 12", na=False)].copy()
+        daily_summary = summary[summary["Metodo"].eq("Diário / 252")].copy() if not summary.empty else pd.DataFrame()
+        monthly_summary = summary[summary["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not summary.empty else pd.DataFrame()
+        daily_detail = detail[detail["Metodo"].eq("Diário / 252")].copy() if not detail.empty else pd.DataFrame()
+        monthly_detail = detail[detail["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not detail.empty else pd.DataFrame()
 
         st.subheader("Resultado da cobrança")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Fee total", f"R$ {detail['Fee_Calculado'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        m2.metric("Fee diário", f"R$ {daily_detail['Fee_Calculado'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        m3.metric("Fee mensal", f"R$ {monthly_detail['Fee_Calculado'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        m4.metric("Pendências de match", f"{len(unmatched):,}".replace(",", "."))
+        total_fee = detail["Fee_Calculado"].sum() if not detail.empty else 0
+        m1.metric("Fee total", fmt_brl(total_fee))
+        m2.metric("Fee cálculo diário", fmt_brl(daily_detail["Fee_Calculado"].sum() if not daily_detail.empty else 0))
+        m3.metric("Fee cálculo mensal", fmt_brl(monthly_detail["Fee_Calculado"].sum() if not monthly_detail.empty else 0))
+        m4.metric("Pendências de cadastro", f"{len(diagnostics):,}".replace(",", "."))
+
+        st.markdown("#### Fee total por conta")
+        if account_summary.empty:
+            st.info("Sem contas calculadas.")
+        else:
+            acct_disp = account_summary.rename(columns={"Conta_norm":"Conta", "Grupo_chave":"Grupo Familiar", "Fee_aa":"Fee a.a.", "Regra_Fee":"Regra do Fee"}).copy()
+            acct_disp["PL Base BRL"] = acct_disp["PL_Base_BRL"].map(fmt_brl)
+            acct_disp["Fee a.a."] = acct_disp["Fee a.a."].map(lambda x: fmt_pct(x,3))
+            acct_disp["Fee Total"] = acct_disp["Fee_Total"].map(fmt_brl)
+            st.dataframe(acct_disp[["Grupo Familiar","Cliente","Corretora","Conta","Regra do Fee","Fee a.a.","PL Base BRL","Fee Total"]], use_container_width=True, hide_index=True, height=360)
 
         tab1, tab2, tab3 = st.tabs(["Cobrança consolidada", "Cálculo diário", "Cálculo mensal"])
         with tab1:
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.dataframe(summary_display(summary), use_container_width=True, hide_index=True, height=440)
         with tab2:
             if daily_summary.empty:
                 st.info("Nenhum arquivo diário carregado para o período.")
             else:
-                st.dataframe(daily_summary, use_container_width=True, hide_index=True)
+                st.dataframe(summary_display(daily_summary), use_container_width=True, hide_index=True, height=440)
         with tab3:
             if monthly_summary.empty:
                 st.info("Safra/XP US sem posição mensal disponível no Controle.")
             else:
-                st.dataframe(monthly_summary, use_container_width=True, hide_index=True)
+                st.dataframe(summary_display(monthly_summary), use_container_width=True, hide_index=True, height=440)
 
-        if not daily_detail.empty:
-            st.subheader("Cobertura de arquivos diários")
-            rows = []
-            for broker, sub in daily_detail.groupby("Corretora"):
-                last_date = sub["Data"].dropna().max()
-                expected = expected_business_days(int(year), int(month), last_date.date() if pd.notna(last_date) else None)
-                found = int(sub["Data"].nunique())
-                rows.append({
-                    "Corretora": broker,
-                    "Dias encontrados": found,
-                    "Dias úteis esperados até a última data": expected,
-                    "Cobertura": found / expected if expected else 0,
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.subheader("Cobertura dos arquivos diários")
+        if coverage.empty:
+            st.info("Nenhuma fonte diária carregada.")
+        else:
+            st.dataframe(coverage_display(coverage), use_container_width=True, hide_index=True)
+            missing_brokers = coverage[coverage["Datas Ausentes"].ne("Nenhuma")]
+            if not missing_brokers.empty:
+                st.warning("Há datas úteis sem arquivo/posição. Confira a coluna 'Datas Ausentes' antes do fechamento.")
 
-        if not unmatched.empty:
-            st.warning("Há contas nas fontes diárias que não foram encontradas no Controle. Elas aparecem em Pendências Match e não devem ser cobradas sem conferência.")
+        st.subheader("Conferência de contas")
+        st.caption("Charles Schwab: contas que aparecem no CS Total e não existem no Controle são ignoradas automaticamente e não viram pendência.")
+        if diagnostics.empty:
+            st.success("XP e BTG sem divergências entre contas carregadas e Controle.")
+        else:
+            st.dataframe(diagnostics_display(diagnostics), use_container_width=True, hide_index=True, height=380)
 
-        excel = export_excel(registry, groups, detail, summary, unmatched, int(year), int(month))
+        excel = export_excel(registry, groups, detail, summary, diagnostics, coverage, account_summary, int(year), int(month))
         st.download_button(
-            "Baixar memória completa (.xlsx)",
-            data=excel,
+            "Baixar memória completa (.xlsx)", data=excel,
             file_name=f"Fee_MWealth_{int(year)}_{int(month):02d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
 
         st.subheader("Downloads por corretora")
-        for broker in sorted(detail["Corretora"].dropna().unique()):
-            sub = detail[detail["Corretora"] == broker]
-            csv_bytes = sub.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-            st.download_button(
-                f"Baixar cálculo — {broker}",
-                data=csv_bytes,
-                file_name=f"Calculo_Fee_{broker.replace(' ', '_')}_{int(year)}_{int(month):02d}.csv",
-                mime="text/csv",
-                key=f"dl_{broker}",
-            )
+        if not detail.empty:
+            cols = st.columns(min(4, max(1, detail["Corretora"].nunique())))
+            for i, broker in enumerate(sorted(detail["Corretora"].dropna().unique())):
+                sub = detail[detail["Corretora"].eq(broker)].copy()
+                csv_bytes = sub.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+                with cols[i % len(cols)]:
+                    st.download_button(
+                        f"Baixar — {broker}", data=csv_bytes,
+                        file_name=f"Calculo_Fee_{broker.replace(' ', '_')}_{int(year)}_{int(month):02d}.csv",
+                        mime="text/csv", key=f"dl_{broker}", use_container_width=True,
+                    )

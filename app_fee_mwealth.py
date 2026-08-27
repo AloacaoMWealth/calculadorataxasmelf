@@ -17,7 +17,7 @@ from PIL import Image
 # M WEALTH - MOTOR DE FEE
 # ============================================================
 # Regras principais:
-# 1) O PL do GRUPO FAMILIAR na data de referência define a faixa.
+# 1) O PL do GRUPO FAMILIAR no fechamento do mês calculado define a faixa.
 # 2) Cada conta usa a Tabela Fee cadastrada no Controle de Clientes.
 # 3) Contas com PL diário: Fee dia = PL_BRL * taxa_aa / 250.
 # 4) Contas mensais: Fee mês = PL_BRL * taxa_aa / 12.
@@ -175,18 +175,28 @@ def parse_fee_tables(raw: pd.DataFrame) -> dict[str, list[tuple[float, Optional[
 
 
 def choose_reference_pl_column(pl_cols: list[str], year: int, month: int) -> tuple[str, date]:
-    target = month_end_before(year, month)
+    """Usa a última posição disponível DENTRO do mês selecionado para segmentação.
+
+    Regra operacional: o mês calculado e a segmentação usam a mesma fotografia de
+    fechamento. Ex.: cobrança 07/2026 -> PL de fechamento de 07/2026 e PTAX dessa
+    mesma data. Enquanto o fechamento definitivo não estiver disponível, usa a
+    posição mais recente do próprio mês como prévia.
+    """
     candidates = []
     for c in pl_cols:
         try:
             d = datetime.strptime(c[3:], "%d/%m/%Y").date()
-            if d <= target:
+            if d.year == year and d.month == month:
                 candidates.append((d, c))
         except Exception:
             continue
     if not candidates:
-        raise ValueError("Não encontrei coluna de PL anterior ao mês selecionado no Controle de Clientes.")
-    return max(candidates)[1], max(candidates)[0]
+        raise ValueError(
+            f"Não encontrei coluna de PL no Controle para {month:02d}/{year}. "
+            "A segmentação precisa usar uma posição do próprio mês calculado."
+        )
+    d, c = max(candidates)
+    return c, d
 
 
 def choose_billing_pl_column(pl_cols: list[str], year: int, month: int) -> tuple[str, date, bool]:
@@ -350,7 +360,7 @@ def read_btg_daily(files: Iterable, year: int, month: int) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
-def read_cs_daily(files: Iterable, year: int, month: int, manual_ptax: dict[date, float]) -> pd.DataFrame:
+def read_cs_daily(files: Iterable, year: int, month: int, manual_ptax: dict[date, float], reference_date: Optional[date] = None) -> pd.DataFrame:
     """Lê posições diárias em USD e converte todo o mês pela PTAX de fechamento.
 
     Enquanto o mês estiver incompleto, usa a data mais recente entre os arquivos
@@ -408,7 +418,10 @@ def read_cs_daily(files: Iterable, year: int, month: int, manual_ptax: dict[date
         return pd.DataFrame()
 
     out = pd.concat(parts, ignore_index=True)
-    close_date = out["Data"].max().date()
+    # Toda a posição offshore do mês usa a PTAX da mesma data de referência
+    # utilizada na segmentação. Isso evita mudança de faixa causada por usar
+    # câmbios diferentes entre segmentação e cobrança.
+    close_date = reference_date or out["Data"].max().date()
     ptax, ptax_date, src = ptax_with_manual(close_date, manual_ptax)
     out["PTAX"] = ptax
     out["Data_PTAX"] = pd.Timestamp(ptax_date)
@@ -451,9 +464,17 @@ def read_monthly_standardized(file, broker: str, year: int, month: int,
 
 
 def build_monthly_from_control(registry: pd.DataFrame, ctrl: pd.DataFrame, pl_cols: list[str],
-                               year: int, month: int, manual_ptax: dict[date, float]) -> tuple[pd.DataFrame, dict]:
-    """Gera cobrança mensal de Safra e XP US diretamente do Controle de Clientes."""
-    billing_col, billing_date, is_close = choose_billing_pl_column(pl_cols, year, month)
+                               year: int, month: int, manual_ptax: dict[date, float],
+                               reference_col: Optional[str] = None,
+                               reference_date: Optional[date] = None) -> tuple[pd.DataFrame, dict]:
+    """Gera cobrança mensal de Safra e XP US usando o mesmo fechamento da segmentação."""
+    if reference_col is not None and reference_date is not None:
+        billing_col, billing_date = reference_col, reference_date
+        month_end = (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(1)).date()
+        last_business = pd.bdate_range(pd.Timestamp(year, month, 1), pd.Timestamp(month_end))[-1].date()
+        is_close = billing_date >= last_business
+    else:
+        billing_col, billing_date, is_close = choose_billing_pl_column(pl_cols, year, month)
     base = ctrl[ctrl["Corretora"].isin(MONTHLY_FROM_CONTROL_BROKERS)].copy()
     base["PL_original"] = pd.to_numeric(base[billing_col], errors="coerce").fillna(0.0)
     base["Data"] = pd.Timestamp(billing_date)
@@ -905,7 +926,7 @@ r2.metric("ROA médio contratado", fmt_pct(roa, 3))
 r3.metric("Fee mensal teórico", fmt_brl(fee_ann/12))
 r4.metric("Contas cadastradas", f"{accounts_count:,}".replace(",", "."))
 r5.metric("Grupos familiares", f"{groups_count:,}".replace(",", "."))
-st.markdown(f'<div class="small-note">Referência da faixa: {ref_date:%d/%m/%Y} · Último PL disponível no Controle: {latest_pl_date:%d/%m/%Y}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="small-note">Fechamento usado na segmentação: {ref_date:%d/%m/%Y} · Último PL disponível no Controle: {latest_pl_date:%d/%m/%Y}</div>', unsafe_allow_html=True)
 
 with st.expander("Cadastro de fee e segmentação", expanded=False):
     st.dataframe(registry_display(registry), use_container_width=True, hide_index=True, height=420)
@@ -923,7 +944,7 @@ with c3:
 monthly_preview = None
 monthly_meta = None
 try:
-    monthly_preview, monthly_meta = build_monthly_from_control(registry, ctrl, pl_cols, int(year), int(month), manual_ptax)
+    monthly_preview, monthly_meta = build_monthly_from_control(registry, ctrl, pl_cols, int(year), int(month), manual_ptax, ref_col, ref_date)
 except Exception:
     monthly_preview = None
 
@@ -942,7 +963,7 @@ if st.button("Calcular cobrança", type="primary", use_container_width=True):
             errors.append(f"BTG: {e}")
     if cs_files:
         try:
-            parts.append(read_cs_daily(cs_files, int(year), int(month), manual_ptax))
+            parts.append(read_cs_daily(cs_files, int(year), int(month), manual_ptax, ref_date))
         except Exception as e:
             errors.append(f"Charles Schwab: {e}")
     if monthly_preview is not None and not monthly_preview.empty:

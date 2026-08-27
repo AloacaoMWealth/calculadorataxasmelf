@@ -658,35 +658,52 @@ def fmt_pct(v, decimals=2) -> str:
     return f"{float(v) * 100:.{decimals}f}%".replace(".", ",")
 
 
+def _group_label(df: pd.DataFrame) -> pd.Series:
+    """Retorna uma única série de grupo sem criar nomes de coluna duplicados."""
+    if "Grupo_chave" in df.columns:
+        return df["Grupo_chave"]
+    if "Grupo Familiar" in df.columns:
+        return df["Grupo Familiar"]
+    return pd.Series("", index=df.index, dtype="object")
+
+
 def registry_display(registry: pd.DataFrame) -> pd.DataFrame:
     d = registry.copy()
-    d["PL Referência USD"] = d["PL_ref_original"].where(d["Moeda_ref"].eq("USD")).map(fmt_usd)
-    d["PL Referência BRL"] = d["PL_ref_BRL"].map(fmt_brl)
-    d["PL Grupo Familiar"] = d["PL_Grupo_Ref_BRL"].map(fmt_brl)
-    d["Participação"] = d["Participacao_no_Grupo"].map(fmt_pct)
-    d["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
-    d["Fee Mensal Teórico"] = d["Fee_Projetado_Mensal_Ref"].map(fmt_brl)
-    return d.rename(columns={
-        "Grupo_chave": "Grupo Familiar", "Conta_norm": "Conta", "Tabela Fee": "Tabela",
-        "Regra_Fee": "Regra do Fee", "Corretora": "Corretora", "Cliente": "Cliente"
-    })[["Grupo Familiar", "Cliente", "Corretora", "Conta", "Tabela", "Regra do Fee",
-        "PL Referência USD", "PL Referência BRL", "PL Grupo Familiar", "Participação", "Fee a.a.", "Fee Mensal Teórico"]]
+    out = pd.DataFrame(index=d.index)
+    out["Grupo Familiar"] = _group_label(d)
+    out["Cliente"] = d.get("Cliente", "")
+    out["Corretora"] = d.get("Corretora", "")
+    out["Conta"] = d.get("Conta_norm", d.get("Conta", ""))
+    out["Tabela"] = d.get("Tabela Fee", d.get("Tabela", ""))
+    out["Regra do Fee"] = d.get("Regra_Fee", d.get("Regra do Fee", ""))
+    out["PL Referência USD"] = d["PL_ref_original"].where(d["Moeda_ref"].eq("USD")).map(fmt_usd)
+    out["PL Referência BRL"] = d["PL_ref_BRL"].map(fmt_brl)
+    out["PL Grupo Familiar"] = d["PL_Grupo_Ref_BRL"].map(fmt_brl)
+    out["Participação"] = d["Participacao_no_Grupo"].map(fmt_pct)
+    out["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
+    out["Fee Mensal Teórico"] = d["Fee_Projetado_Mensal_Ref"].map(fmt_brl)
+    return out.reset_index(drop=True)
 
 
 def summary_display(summary: pd.DataFrame) -> pd.DataFrame:
     d = summary.copy()
-    d["PL Médio USD"] = d["PL_Medio_USD"].map(fmt_usd)
-    d["PL Médio BRL"] = d["PL_Medio_BRL"].map(fmt_brl)
-    d["PL Fechamento USD"] = d["PL_Fechamento_USD"].map(fmt_usd)
-    d["PL Fechamento BRL"] = d["PL_Fechamento_BRL"].map(fmt_brl)
-    d["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
-    d["Fee do Mês"] = d["Fee_Mes"].map(fmt_brl)
-    d["Período"] = d["Data_Inicial"].dt.strftime("%d/%m/%Y") + " a " + d["Data_Final"].dt.strftime("%d/%m/%Y")
-    return d.rename(columns={
-        "Grupo_chave": "Grupo Familiar", "Conta_norm": "Conta", "Tabela Fee": "Tabela",
-        "Regra_Fee": "Regra do Fee", "Metodo": "Metodologia", "Dias_ou_Registros": "Dias/Registros"
-    })[["Grupo Familiar", "Cliente", "Corretora", "Conta", "Tabela", "Regra do Fee", "Metodologia",
-        "PL Médio USD", "PL Médio BRL", "PL Fechamento USD", "PL Fechamento BRL", "Fee a.a.", "Dias/Registros", "Fee do Mês", "Período"]]
+    out = pd.DataFrame(index=d.index)
+    out["Grupo Familiar"] = _group_label(d)
+    out["Cliente"] = d.get("Cliente", "")
+    out["Corretora"] = d.get("Corretora", "")
+    out["Conta"] = d.get("Conta_norm", d.get("Conta", ""))
+    out["Tabela"] = d.get("Tabela Fee", d.get("Tabela", ""))
+    out["Regra do Fee"] = d.get("Regra_Fee", d.get("Regra do Fee", ""))
+    out["Metodologia"] = d.get("Metodo", d.get("Metodologia", ""))
+    out["PL Médio USD"] = d["PL_Medio_USD"].map(fmt_usd)
+    out["PL Médio BRL"] = d["PL_Medio_BRL"].map(fmt_brl)
+    out["PL Fechamento USD"] = d["PL_Fechamento_USD"].map(fmt_usd)
+    out["PL Fechamento BRL"] = d["PL_Fechamento_BRL"].map(fmt_brl)
+    out["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
+    out["Dias/Registros"] = d.get("Dias_ou_Registros", d.get("Dias/Registros", ""))
+    out["Fee do Mês"] = d["Fee_Mes"].map(fmt_brl)
+    out["Período"] = pd.to_datetime(d["Data_Inicial"]).dt.strftime("%d/%m/%Y") + " a " + pd.to_datetime(d["Data_Final"]).dt.strftime("%d/%m/%Y")
+    return out.reset_index(drop=True)
 
 
 def diagnostics_display(diag: pd.DataFrame) -> pd.DataFrame:

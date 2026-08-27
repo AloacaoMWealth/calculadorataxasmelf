@@ -19,7 +19,7 @@ from PIL import Image
 # Regras principais:
 # 1) O PL do GRUPO FAMILIAR na data de referência define a faixa.
 # 2) Cada conta usa a Tabela Fee cadastrada no Controle de Clientes.
-# 3) Contas com PL diário: Fee dia = PL_BRL * taxa_aa / 252.
+# 3) Contas com PL diário: Fee dia = PL_BRL * taxa_aa / 250.
 # 4) Contas mensais: Fee mês = PL_BRL * taxa_aa / 12.
 # 5) Offshore (Charles Schwab / XP US) é convertido para BRL pela PTAX.
 # ============================================================
@@ -315,7 +315,7 @@ def read_xp_daily(file, year: int, month: int) -> pd.DataFrame:
     df["Moeda"] = "BRL"
     df["PTAX"] = 1.0
     df["PL_BRL"] = df["PL_original"]
-    df["Metodo"] = "Diário / 252"
+    df["Metodo"] = "Diário / 250"
     return df[["Data", "Corretora", "Conta_norm", "PL_original", "Moeda", "PTAX", "PL_BRL", "Metodo"]]
 
 
@@ -345,7 +345,7 @@ def read_btg_daily(files: Iterable, year: int, month: int) -> pd.DataFrame:
         df["Moeda"] = "BRL"
         df["PTAX"] = 1.0
         df["PL_BRL"] = df["PL_original"]
-        df["Metodo"] = "Diário / 252"
+        df["Metodo"] = "Diário / 250"
         parts.append(df[["Data", "Corretora", "Conta_norm", "PL_original", "Moeda", "PTAX", "PL_BRL", "Metodo"]])
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
@@ -414,7 +414,7 @@ def read_cs_daily(files: Iterable, year: int, month: int, manual_ptax: dict[date
     out["Data_PTAX"] = pd.Timestamp(ptax_date)
     out["Fonte_PTAX"] = src
     out["PL_BRL"] = out["PL_original"] * ptax
-    out["Metodo"] = "Diário / 252"
+    out["Metodo"] = "Diário / 250"
     return out[["Data", "Corretora", "Conta_norm", "PL_original", "Moeda", "PTAX", "PL_BRL", "Metodo"]]
 
 def read_monthly_standardized(file, broker: str, year: int, month: int,
@@ -497,9 +497,9 @@ def calculate_fees(mov: pd.DataFrame, registry: pd.DataFrame) -> tuple[pd.DataFr
         return pd.DataFrame(), pd.DataFrame()
 
     out["Fee_Calculado"] = 0.0
-    daily = out["Metodo"].eq("Diário / 252")
+    daily = out["Metodo"].eq("Diário / 250")
     monthly = out["Metodo"].str.startswith("Mensal / 12", na=False)
-    out.loc[daily, "Fee_Calculado"] = out.loc[daily, "PL_BRL"] * out.loc[daily, "Fee_aa"].fillna(0) / 252
+    out.loc[daily, "Fee_Calculado"] = out.loc[daily, "PL_BRL"] * out.loc[daily, "Fee_aa"].fillna(0) / 250
     out.loc[monthly, "Fee_Calculado"] = out.loc[monthly, "PL_BRL"] * out.loc[monthly, "Fee_aa"].fillna(0) / 12
 
     out = out.sort_values(["Corretora", "Conta_norm", "Data"]).reset_index(drop=True)
@@ -771,7 +771,7 @@ def export_excel(registry, groups, detail, summary, diagnostics, coverage, accou
     reg, grp, summ, det, diag, cov, acct = _pretty_export_frames(
         registry, groups, detail, summary, diagnostics, coverage, account_summary
     )
-    daily = det[det["Metodologia"].eq("Diário / 252")].copy() if not det.empty else pd.DataFrame()
+    daily = det[det["Metodologia"].eq("Diário / 250")].copy() if not det.empty else pd.DataFrame()
     monthly = det[det["Metodologia"].str.startswith("Mensal / 12", na=False)].copy() if not det.empty else pd.DataFrame()
 
     datasets = {
@@ -957,13 +957,13 @@ if st.button("Calcular cobrança", type="primary", use_container_width=True):
     else:
         mov = pd.concat(valid, ignore_index=True)
         diagnostics = build_match_diagnostics(mov, registry)
-        coverage = build_coverage(mov[mov["Metodo"].eq("Diário / 252")].copy(), int(year), int(month))
+        coverage = build_coverage(mov[mov["Metodo"].eq("Diário / 250")].copy(), int(year), int(month))
         detail, summary = calculate_fees(mov, registry)
         account_summary = build_account_fee_summary(summary)
 
-        daily_summary = summary[summary["Metodo"].eq("Diário / 252")].copy() if not summary.empty else pd.DataFrame()
+        daily_summary = summary[summary["Metodo"].eq("Diário / 250")].copy() if not summary.empty else pd.DataFrame()
         monthly_summary = summary[summary["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not summary.empty else pd.DataFrame()
-        daily_detail = detail[detail["Metodo"].eq("Diário / 252")].copy() if not detail.empty else pd.DataFrame()
+        daily_detail = detail[detail["Metodo"].eq("Diário / 250")].copy() if not detail.empty else pd.DataFrame()
         monthly_detail = detail[detail["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not detail.empty else pd.DataFrame()
 
         st.subheader("Resultado da cobrança")

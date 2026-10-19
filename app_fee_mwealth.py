@@ -1174,7 +1174,7 @@ st.markdown(f"""
 
     .mw-header {{
         display:flex; align-items:flex-end; justify-content:space-between; gap:2rem;
-        padding: .35rem 0 1.15rem 0; margin-bottom:.55rem;
+        padding: .15rem 0 1.15rem 0; margin-bottom:.55rem;
         border-bottom:1px solid var(--mw-border);
     }}
     .mw-brand-row {{display:flex; align-items:center; gap:.65rem; margin-bottom:.45rem;}}

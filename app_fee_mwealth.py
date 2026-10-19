@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import io
 import re
-import zipfile
 from pathlib import Path
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
 
@@ -26,6 +24,12 @@ from PIL import Image
 
 OFFSHORE_BROKERS = {"CHARLES SCHWAB", "XP US", "XP GLOBAL"}
 MONTHLY_FROM_CONTROL_BROKERS = {"SAFRA", "XP US", "XP GLOBAL"}
+DAILY_BASIS = 250
+SEGMENTATION_AUX_SHEETS = {"Contas Atívore": "ATIVORE"}
+WEALTH_NAVY = "#141C24"
+WEALTH_NAVY_2 = "#131925"
+WEALTH_SAND = "#DCC9B1"
+WEALTH_BLUE = "#5D73AF"
 APP_DIR = Path(__file__).resolve().parent
 CONTROL_CANDIDATES = [
     APP_DIR / "data" / "controle_clientes.xlsx",
@@ -104,11 +108,12 @@ def fetch_ptax_usd(d: date) -> tuple[float, date]:
             r.raise_for_status()
             vals = r.json().get("value", [])
             if vals:
-                # último boletim do dia; cotacaoVenda = BRL por USD
-                return float(vals[-1]["cotacaoVenda"]), probe
+                # Usa o último boletim disponível do dia; cotacaoVenda = BRL por USD.
+                last = max(vals, key=lambda x: str(x.get("dataHoraCotacao", "")))
+                return float(last["cotacaoVenda"]), probe
         except Exception:
             pass
-        probe = previous_business_day(probe + timedelta(days=1))
+        probe = previous_business_day(probe)
     raise RuntimeError(f"Não foi possível obter a PTAX para {d:%d/%m/%Y} nem dias anteriores.")
 
 
@@ -119,8 +124,15 @@ def ptax_with_manual(d: date, manual: dict[date, float]) -> tuple[float, date, s
     return value, used_date, "BCB"
 
 
-def read_control(file) -> tuple[pd.DataFrame, dict[str, list[tuple[float, Optional[float], float]]], list[str]]:
-    ctrl = pd.read_excel(file, sheet_name="Controle Contas", dtype=object)
+def read_control(file) -> tuple[pd.DataFrame, dict[str, list[tuple[float, Optional[float], float]]], list[str], pd.DataFrame]:
+    """Lê a base principal e custódias auxiliares usadas apenas na segmentação.
+
+    A aba ``Controle Contas`` contém as contas efetivamente cobradas. Abas auxiliares
+    como ``Contas Atívore`` entram no PL do grupo familiar para definição da faixa,
+    mas não geram fee nem exigem uma conta de cobrança.
+    """
+    xls = pd.ExcelFile(file)
+    ctrl = pd.read_excel(xls, sheet_name="Controle Contas", dtype=object)
     ctrl.columns = [norm_text(c) for c in ctrl.columns]
 
     required = ["Corretora", "Grupo Familiar", "Cliente", "Conta", "Tabela Fee"]
@@ -133,12 +145,35 @@ def read_control(file) -> tuple[pd.DataFrame, dict[str, list[tuple[float, Option
     ctrl["Cliente"] = ctrl["Cliente"].map(norm_text)
     ctrl["Conta_norm"] = ctrl["Conta"].map(norm_account)
     ctrl["Tabela Fee"] = ctrl["Tabela Fee"].map(norm_text)
+    ctrl = ctrl[ctrl["Corretora"].ne("") & ctrl["Cliente"].ne("")].copy()
 
-    fee_raw = pd.read_excel(file, sheet_name="Tabelas Fee", header=None, dtype=object)
+    fee_raw = pd.read_excel(xls, sheet_name="Tabelas Fee", header=None, dtype=object)
     fee_tables = parse_fee_tables(fee_raw)
     pl_cols = [c for c in ctrl.columns if re.fullmatch(r"PL \d{2}/\d{2}/\d{4}", str(c))]
-    return ctrl, fee_tables, pl_cols
 
+    aux_parts = []
+    for sheet_name, broker_name in SEGMENTATION_AUX_SHEETS.items():
+        if sheet_name not in xls.sheet_names:
+            continue
+        aux = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
+        aux.columns = [norm_text(c) for c in aux.columns]
+        if "Grupo Familiar" not in aux.columns or "Cliente" not in aux.columns:
+            raise ValueError(
+                f"A aba '{sheet_name}' precisa ter ao menos as colunas Grupo Familiar e Cliente."
+            )
+        if "Corretora" not in aux.columns:
+            aux["Corretora"] = broker_name
+        aux["Corretora"] = aux["Corretora"].map(lambda x: norm_text(x).upper() or broker_name)
+        aux["Grupo Familiar"] = aux["Grupo Familiar"].map(norm_text)
+        aux["Cliente"] = aux["Cliente"].map(norm_text)
+        if "Moeda" not in aux.columns:
+            aux["Moeda"] = "BRL"
+        aux["Moeda"] = aux["Moeda"].map(lambda x: norm_text(x).upper() or "BRL")
+        aux = aux[aux["Grupo Familiar"].ne("") | aux["Cliente"].ne("")].copy()
+        aux_parts.append(aux)
+
+    segmentation_aux = pd.concat(aux_parts, ignore_index=True, sort=False) if aux_parts else pd.DataFrame()
+    return ctrl, fee_tables, pl_cols, segmentation_aux
 
 def parse_fee_tables(raw: pd.DataFrame) -> dict[str, list[tuple[float, Optional[float], float]]]:
     """Lê blocos do tipo [Taxa | Início | Término] da aba Tabelas Fee."""
@@ -237,17 +272,20 @@ def find_fixed_control_path() -> Optional[Path]:
 
 
 def fixed_rate_from_label(label: str) -> Optional[float]:
+    """Reconhece sem cobrança e taxas fixas descritas entre parênteses.
+
+    Exemplos aceitos: ``Tesouraria (0,35)``, ``Tesouraria (0,40%)`` e
+    ``Fee fixo (0,50%)``. Rótulos como ``Tabela 1`` não são interpretados
+    como taxa fixa.
+    """
     s = norm_text(label).upper()
     if s in NO_FEE_LABELS or "SEM COBR" in s:
         return 0.0
-    # Exemplos: Tesouraria (0,35), Tesouraria (0,40%)
-    if "TESOURARIA" in s:
-        m = re.search(r"(\d+[,.]\d+)\s*%?", s)
-        if m:
-            pct = float(m.group(1).replace(",", "."))
-            return pct / 100.0
+    m = re.search(r"\((\d+(?:[,.]\d+)?)\s*%?\)", s)
+    if m:
+        pct = float(m.group(1).replace(",", "."))
+        return pct / 100.0
     return None
-
 
 def lookup_fee_rate(table_label: str, group_pl_brl: float, fee_tables) -> tuple[Optional[float], str]:
     fixed = fixed_rate_from_label(table_label)
@@ -270,7 +308,13 @@ def lookup_fee_rate(table_label: str, group_pl_brl: float, fee_tables) -> tuple[
 
 
 def build_fee_registry(ctrl: pd.DataFrame, fee_tables, ref_col: str, ref_date: date,
-                       manual_ptax: dict[date, float]) -> tuple[pd.DataFrame, pd.DataFrame]:
+                       manual_ptax: dict[date, float], segmentation_aux: Optional[pd.DataFrame] = None
+                       ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Monta cadastro de fee e PL consolidado para segmentação.
+
+    Custódias auxiliares (hoje Atívore) entram exclusivamente no PL total do grupo.
+    Elas não criam uma linha de cobrança, mas podem alterar a faixa regressiva.
+    """
     df = ctrl.copy()
     df["PL_ref_original"] = pd.to_numeric(df[ref_col], errors="coerce").fillna(0.0)
 
@@ -278,11 +322,38 @@ def build_fee_registry(ctrl: pd.DataFrame, fee_tables, ref_col: str, ref_date: d
     df["Moeda_ref"] = df["Corretora"].apply(lambda x: "USD" if x in OFFSHORE_BROKERS else "BRL")
     df["PTAX_ref"] = df["Moeda_ref"].apply(lambda x: ref_ptax if x == "USD" else 1.0)
     df["PL_ref_BRL"] = df["PL_ref_original"] * df["PTAX_ref"]
-
-    # Grupo Familiar vazio cai no Cliente para não misturar vazios.
     df["Grupo_chave"] = df["Grupo Familiar"].where(df["Grupo Familiar"].ne(""), df["Cliente"])
-    group = df.groupby("Grupo_chave", dropna=False)["PL_ref_BRL"].sum().rename("PL_Grupo_Ref_BRL")
-    df = df.merge(group, left_on="Grupo_chave", right_index=True, how="left")
+
+    core_group = df.groupby("Grupo_chave", dropna=False)["PL_ref_BRL"].sum()
+
+    aux_group = pd.Series(dtype="float64", name="PL_Aux_Grupo_BRL")
+    ativore_group = pd.Series(dtype="float64", name="PL_Ativore_Grupo_BRL")
+    if segmentation_aux is not None and not segmentation_aux.empty:
+        if ref_col not in segmentation_aux.columns:
+            raise ValueError(
+                f"A aba de custódias auxiliares não possui '{ref_col}'. "
+                "Atualize a Atívore para o mesmo fechamento usado na segmentação."
+            )
+        aux = segmentation_aux.copy()
+        aux["PL_aux_original"] = pd.to_numeric(aux[ref_col], errors="coerce").fillna(0.0)
+        aux["Grupo_chave"] = aux["Grupo Familiar"].where(aux["Grupo Familiar"].ne(""), aux["Cliente"])
+        aux["Moeda"] = aux.get("Moeda", "BRL").map(lambda x: norm_text(x).upper() or "BRL")
+        aux["PTAX_aux"] = aux["Moeda"].apply(lambda x: ref_ptax if x == "USD" else 1.0)
+        aux["PL_aux_BRL"] = aux["PL_aux_original"] * aux["PTAX_aux"]
+        aux_group = aux.groupby("Grupo_chave", dropna=False)["PL_aux_BRL"].sum().rename("PL_Aux_Grupo_BRL")
+        ativore_group = (
+            aux[aux["Corretora"].eq("ATIVORE")]
+            .groupby("Grupo_chave", dropna=False)["PL_aux_BRL"].sum()
+            .rename("PL_Ativore_Grupo_BRL")
+        )
+
+    all_groups = core_group.index.union(aux_group.index)
+    total_group = core_group.reindex(all_groups, fill_value=0.0).add(
+        aux_group.reindex(all_groups, fill_value=0.0), fill_value=0.0
+    ).rename("PL_Grupo_Ref_BRL")
+
+    df["PL_Grupo_Ref_BRL"] = df["Grupo_chave"].map(total_group).fillna(0.0)
+    df["PL_Ativore_Grupo_BRL"] = df["Grupo_chave"].map(ativore_group).fillna(0.0)
     df["Participacao_no_Grupo"] = df["PL_ref_BRL"] / df["PL_Grupo_Ref_BRL"].replace(0, pd.NA)
 
     rates, rules = [], []
@@ -295,12 +366,14 @@ def build_fee_registry(ctrl: pd.DataFrame, fee_tables, ref_col: str, ref_date: d
     df["Fee_Projetado_Anual_Ref"] = df["PL_ref_BRL"] * df["Fee_aa"].fillna(0)
     df["Fee_Projetado_Mensal_Ref"] = df["Fee_Projetado_Anual_Ref"] / 12
 
-    group_view = (
-        df.groupby("Grupo_chave", as_index=False)
-          .agg(PL_Grupo_Ref_BRL=("PL_ref_BRL", "sum"),
-               Contas=("Conta_norm", "count"),
-               Fee_Projetado_Anual=("Fee_Projetado_Anual_Ref", "sum"))
-    )
+    fee_group = df.groupby("Grupo_chave", dropna=False)["Fee_Projetado_Anual_Ref"].sum()
+    count_group = df.groupby("Grupo_chave", dropna=False)["Conta_norm"].count()
+    group_view = pd.DataFrame({"Grupo_chave": all_groups})
+    group_view["PL_Cobrado_Ref_BRL"] = group_view["Grupo_chave"].map(core_group).fillna(0.0)
+    group_view["PL_Ativore_Grupo_BRL"] = group_view["Grupo_chave"].map(ativore_group).fillna(0.0)
+    group_view["PL_Grupo_Ref_BRL"] = group_view["Grupo_chave"].map(total_group).fillna(0.0)
+    group_view["Contas"] = group_view["Grupo_chave"].map(count_group).fillna(0).astype(int)
+    group_view["Fee_Projetado_Anual"] = group_view["Grupo_chave"].map(fee_group).fillna(0.0)
     group_view["ROA_Contratado"] = group_view["Fee_Projetado_Anual"] / group_view["PL_Grupo_Ref_BRL"].replace(0, pd.NA)
     group_view["Data_Referencia"] = pd.Timestamp(ref_date)
     group_view["PTAX_Referencia"] = ref_ptax
@@ -309,11 +382,11 @@ def build_fee_registry(ctrl: pd.DataFrame, fee_tables, ref_col: str, ref_date: d
 
     keep = [
         "Grupo_chave", "Grupo Familiar", "Cliente", "Corretora", "Conta_norm", "Tabela Fee",
-        "PL_ref_original", "Moeda_ref", "PTAX_ref", "PL_ref_BRL", "PL_Grupo_Ref_BRL",
-        "Participacao_no_Grupo", "Fee_aa", "Regra_Fee", "Fee_Projetado_Mensal_Ref"
+        "PL_ref_original", "Moeda_ref", "PTAX_ref", "PL_ref_BRL", "PL_Ativore_Grupo_BRL",
+        "PL_Grupo_Ref_BRL", "Participacao_no_Grupo", "Fee_aa", "Regra_Fee",
+        "Fee_Projetado_Mensal_Ref"
     ]
-    return df[keep].copy(), group_view
-
+    return df[keep].copy(), group_view.sort_values("Grupo_chave").reset_index(drop=True)
 
 def read_xp_daily(file, year: int, month: int) -> pd.DataFrame:
     df = pd.read_excel(file, sheet_name="Taxa Clientes", dtype=object)
@@ -526,7 +599,7 @@ def calculate_fees(mov: pd.DataFrame, registry: pd.DataFrame) -> tuple[pd.DataFr
     out["Fee_Calculado"] = 0.0
     daily = out["Metodo"].eq("Diário / 250")
     monthly = out["Metodo"].str.startswith("Mensal / 12", na=False)
-    out.loc[daily, "Fee_Calculado"] = out.loc[daily, "PL_BRL"] * out.loc[daily, "Fee_aa"].fillna(0) / 250
+    out.loc[daily, "Fee_Calculado"] = out.loc[daily, "PL_BRL"] * out.loc[daily, "Fee_aa"].fillna(0) / DAILY_BASIS
     out.loc[monthly, "Fee_Calculado"] = out.loc[monthly, "PL_BRL"] * out.loc[monthly, "Fee_aa"].fillna(0) / 12
 
     out = out.sort_values(["Corretora", "Conta_norm", "Data"]).reset_index(drop=True)
@@ -632,26 +705,33 @@ def build_coverage(mov: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
 
 
 def _xp_global_target_map(registry: pd.DataFrame) -> dict[tuple[str, str], str]:
-    """Mapeia cada conta XP Global para uma conta XP Brasil do mesmo cliente.
+    """Mapeia XP Global para a conta XP Brasil onde a cobrança será lançada.
 
-    Quando houver mais de uma conta XP Brasil, usa a de maior PL de referência.
-    Isso evita direcionar a cobrança para uma conta zerada/inativa quando existe
-    outra conta local ativa para o mesmo cliente.
+    Prioridade: (1) mesmo Cliente; (2) se não houver match nominal, usa a conta XP
+    do mesmo grupo familiar somente quando existir uma única candidata. Quando houver
+    ambiguidade, não força o vínculo e deixa a linha para revisão.
     """
     mapping: dict[tuple[str, str], str] = {}
     global_rows = registry[registry["Corretora"].eq("XP GLOBAL")].copy()
     for _, row in global_rows.iterrows():
         client = norm_text(row.get("Cliente", ""))
+        group = norm_text(row.get("Grupo_chave", ""))
         source_account = norm_account(row.get("Conta_norm", ""))
-        candidates = registry[(registry["Corretora"].eq("XP")) & (registry["Cliente"].eq(client))].copy()
-        candidates = candidates[candidates["Conta_norm"].astype(str).ne("")]
+        local = registry[registry["Corretora"].eq("XP")].copy()
+        local = local[local["Conta_norm"].astype(str).ne("")]
+
+        candidates = local[local["Cliente"].eq(client)].copy()
+        if candidates.empty:
+            group_candidates = local[local["Grupo_chave"].eq(group)].copy()
+            if group_candidates["Conta_norm"].nunique() == 1:
+                candidates = group_candidates
         if candidates.empty:
             continue
+
         candidates["_pl"] = pd.to_numeric(candidates["PL_ref_BRL"], errors="coerce").fillna(0.0)
         target = candidates.sort_values(["_pl", "Conta_norm"], ascending=[False, True]).iloc[0]["Conta_norm"]
         mapping[(client, source_account)] = str(target)
     return mapping
-
 
 def annotate_billing_destination(detail: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
     """Acrescenta o destino operacional da cobrança sem apagar a origem do cálculo."""
@@ -735,7 +815,14 @@ def build_billing_summary(detail: pd.DataFrame, registry: pd.DataFrame) -> tuple
             "Contas_XP_Global": ", ".join(global_accounts),
             "Observacao": " · ".join(notes),
         })
-    final = pd.DataFrame(rows).sort_values(["Corretora_Cobranca", "Cliente", "Conta_Cobranca"]).reset_index(drop=True)
+    final = pd.DataFrame(rows)
+    if not final.empty:
+        value_cols = ["PL_Local_BRL", "PL_XP_Global_BRL", "Fee_Total"]
+        keep_mask = pd.Series(False, index=final.index)
+        for col in value_cols:
+            keep_mask |= pd.to_numeric(final[col], errors="coerce").fillna(0).abs().gt(1e-9)
+        final = final[keep_mask].copy()
+        final = final.sort_values(["Corretora_Cobranca", "Cliente", "Conta_Cobranca"]).reset_index(drop=True)
     return annotated, final
 
 
@@ -833,6 +920,8 @@ def registry_display(registry: pd.DataFrame) -> pd.DataFrame:
     out["Regra do Fee"] = d.get("Regra_Fee", d.get("Regra do Fee", ""))
     out["PL Referência USD"] = d["PL_ref_original"].where(d["Moeda_ref"].eq("USD")).map(fmt_usd)
     out["PL Referência BRL"] = d["PL_ref_BRL"].map(fmt_brl)
+    if "PL_Ativore_Grupo_BRL" in d.columns and pd.to_numeric(d["PL_Ativore_Grupo_BRL"], errors="coerce").fillna(0).ne(0).any():
+        out["PL Atívore no Grupo"] = d["PL_Ativore_Grupo_BRL"].map(fmt_brl)
     out["PL Grupo Familiar"] = d["PL_Grupo_Ref_BRL"].map(fmt_brl)
     out["Participação"] = d["Participacao_no_Grupo"].map(fmt_pct)
     out["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
@@ -892,6 +981,8 @@ def _segmentacao_export(registry: pd.DataFrame) -> pd.DataFrame:
     out["PL Referência USD"] = reg["PL_ref_original"].where(reg["Moeda_ref"].eq("USD"))
     out["PTAX Referência"] = reg["PTAX_ref"].where(reg["Moeda_ref"].eq("USD"))
     out["PL Referência BRL"] = reg["PL_ref_BRL"]
+    if "PL_Ativore_Grupo_BRL" in reg.columns:
+        out["PL Atívore Grupo BRL"] = reg["PL_Ativore_Grupo_BRL"]
     out["PL Grupo Familiar BRL"] = reg["PL_Grupo_Ref_BRL"]
     out["Participação no Grupo"] = reg["Participacao_no_Grupo"]
     out["Fee a.a."] = reg["Fee_aa"]
@@ -901,6 +992,8 @@ def _segmentacao_export(registry: pd.DataFrame) -> pd.DataFrame:
 def _groups_export(groups: pd.DataFrame) -> pd.DataFrame:
     return groups.copy().rename(columns={
         "Grupo_chave": "Grupo Familiar",
+        "PL_Cobrado_Ref_BRL": "PL Contas Cobradas BRL",
+        "PL_Ativore_Grupo_BRL": "PL Atívore BRL",
         "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL",
         "Fee_Projetado_Anual": "Fee Projetado Anual",
         "ROA_Contratado": "ROA Contratado",
@@ -982,8 +1075,8 @@ def export_excel(registry, groups, detail, billing, year, month, ref_date) -> by
         ["PTAX de referência", f"{ptax_ref:.4f}" if ptax_ref is not None else "—"],
         ["", ""],
         ["Resumo Cobranca", "Resumo operacional para cobrança. A XP Global é incorporada à conta XP Brasil do mesmo cliente e aparece destacada em colunas próprias."],
-        ["Segmentacao", "Fotografia usada para definir a faixa de fee: PL do mês selecionado, conversão offshore pela PTAX do fechamento, participação e taxa aplicada."],
-        ["Grupos", "Consolidado por grupo familiar com PL total, quantidade de contas, ROA contratado e referência cambial."],
+        ["Segmentacao", "Fotografia usada para definir a faixa de fee. Inclui custódias auxiliares como Atívore no PL do grupo, sem gerar cobrança própria."],
+        ["Grupos", "Consolidado por grupo familiar, separando PL das contas cobradas e PL Atívore usado somente para segmentação."],
         ["Memoria Calculo", "Trilha completa do cálculo por data/conta. Mantém a XP Global como origem separada e informa em qual conta XP Brasil o fee foi incorporado."],
     ], columns=["Item / Aba", "Descrição"])
 
@@ -1000,7 +1093,7 @@ def export_excel(registry, groups, detail, billing, year, month, ref_date) -> by
             data.to_excel(writer, sheet_name=sname, index=False)
 
         wb = writer.book
-        fmt_header = wb.add_format({"bold": True, "bg_color": "#141C24", "font_color": "#FFFFFF", "border": 0, "align": "center", "valign": "vcenter"})
+        fmt_header = wb.add_format({"bold": True, "bg_color": WEALTH_NAVY, "font_color": "#FFFFFF", "border": 0, "align": "center", "valign": "vcenter"})
         fmt_brl_x = wb.add_format({"num_format": 'R$ #,##0.00;[Red](R$ #,##0.00);-'})
         fmt_usd_x = wb.add_format({"num_format": '$ #,##0.00;[Red]($ #,##0.00);-'})
         fmt_pct_x = wb.add_format({"num_format": '0.000%;[Red](0.000%);-'})
@@ -1010,6 +1103,8 @@ def export_excel(registry, groups, detail, billing, year, month, ref_date) -> by
 
         for sname, data in datasets.items():
             ws = writer.sheets[sname]
+            tab_colors = {"LEIA-ME": WEALTH_SAND, "Resumo Cobranca": WEALTH_BLUE, "Segmentacao": WEALTH_BLUE, "Grupos": WEALTH_SAND, "Memoria Calculo": WEALTH_NAVY}
+            ws.set_tab_color(tab_colors.get(sname, WEALTH_BLUE))
             ws.hide_gridlines(2)
             ws.freeze_panes(1, 0)
             ws.set_row(0, 24, fmt_header)
@@ -1057,48 +1152,102 @@ icon_path = find_icon_path()
 page_icon = Image.open(icon_path) if icon_path else "M"
 st.set_page_config(page_title="Calculadora Fee | M Wealth", page_icon=page_icon, layout="wide")
 
-st.markdown("""
+st.markdown(f"""
 <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1520px;}
-    [data-testid="stAppViewContainer"] {background: linear-gradient(180deg, rgba(93,115,175,.08) 0%, rgba(20,28,36,0) 26rem);}
-    .mw-hero {
-        padding: 1.25rem 1.4rem; border: 1px solid rgba(220,201,177,.22);
-        border-radius: 16px; margin-bottom: 1rem;
-        background: linear-gradient(135deg, rgba(20,28,36,.84), rgba(93,115,175,.16));
-        box-shadow: 0 10px 32px rgba(0,0,0,.10);
-    }
-    .mw-kicker {font-size:.72rem; letter-spacing:.14em; text-transform:uppercase; opacity:.62; margin-bottom:.25rem;}
-    .mw-title {font-size:1.95rem; font-weight:700; letter-spacing:-.035em; margin:0;}
-    .mw-sub {font-size:.86rem; opacity:.66; margin-top:.28rem;}
-    h2, h3 {letter-spacing:-.025em;}
-    div[data-testid="stMetric"] {
-        background: rgba(255,255,255,.035); border:1px solid rgba(220,201,177,.16);
-        padding: 14px 16px; border-radius:14px; min-height:102px;
-        box-shadow: 0 7px 20px rgba(0,0,0,.06);
-    }
-    div[data-testid="stMetricLabel"] {font-size:.78rem; opacity:.68;}
-    div[data-testid="stMetricValue"] {font-size:1.32rem;}
-    [data-testid="stDataFrame"] {border:1px solid rgba(128,128,128,.16); border-radius:12px; overflow:hidden;}
-    [data-testid="stFileUploader"] {border-radius:12px;}
-    .small-note {font-size:.80rem; opacity:.62; margin-top:-4px;}
-    .section-label {font-size:.72rem; letter-spacing:.10em; text-transform:uppercase; opacity:.58; margin-top:.4rem;}
-    .section-title {font-size:1.35rem; font-weight:650; letter-spacing:-.025em; margin:.1rem 0 .65rem 0;}
-    div.stButton > button[kind="primary"], div.stDownloadButton > button {border-radius:10px; font-weight:600;}
-    div[data-testid="stExpander"] {border-radius:12px; border-color:rgba(128,128,128,.16);}
+    :root {{
+        --mw-navy: {WEALTH_NAVY};
+        --mw-navy-2: {WEALTH_NAVY_2};
+        --mw-sand: {WEALTH_SAND};
+        --mw-blue: {WEALTH_BLUE};
+        --mw-text: #F7F8FA;
+        --mw-muted: #9EA8B3;
+        --mw-border: rgba(220,201,177,.16);
+    }}
+    .stApp {{ background: #0C1218; color: var(--mw-text); }}
+    [data-testid="stAppViewContainer"] {{
+        background:
+          radial-gradient(circle at 86% 0%, rgba(93,115,175,.16), transparent 29rem),
+          linear-gradient(180deg, #0C1218 0%, #0F161E 100%);
+    }}
+    [data-testid="stHeader"] {{ background: rgba(12,18,24,.78); }}
+    .block-container {{padding-top: 1.45rem; padding-bottom: 4rem; max-width: 1480px;}}
+
+    .mw-header {{
+        display:flex; align-items:flex-end; justify-content:space-between; gap:2rem;
+        padding: .35rem 0 1.15rem 0; margin-bottom:.55rem;
+        border-bottom:1px solid var(--mw-border);
+    }}
+    .mw-brand-row {{display:flex; align-items:center; gap:.65rem; margin-bottom:.45rem;}}
+    .mw-mark {{
+        width:31px; height:31px; border-radius:9px; display:inline-flex; align-items:center; justify-content:center;
+        background:var(--mw-blue); color:white; font-weight:800; font-size:1rem; box-shadow:0 7px 20px rgba(93,115,175,.22);
+    }}
+    .mw-brand {{font-size:.72rem; letter-spacing:.17em; font-weight:650; color:var(--mw-sand); text-transform:uppercase;}}
+    .mw-title {{font-size:2.2rem; line-height:1.05; font-weight:720; letter-spacing:-.045em; color:white; margin:0;}}
+    .mw-sub {{font-size:.88rem; color:var(--mw-muted); margin:.45rem 0 0 0; max-width:760px;}}
+    .mw-version {{font-size:.71rem; color:var(--mw-muted); white-space:nowrap; padding-bottom:.1rem;}}
+
+    .section-label {{font-size:.68rem; letter-spacing:.15em; text-transform:uppercase; color:var(--mw-sand); margin-top:1.25rem; font-weight:650;}}
+    .section-title {{font-size:1.25rem; color:#F7F8FA; font-weight:680; letter-spacing:-.025em; margin:.12rem 0 .65rem 0;}}
+    .small-note {{font-size:.78rem; color:var(--mw-muted); margin-top:.4rem;}}
+    .status-row {{display:flex; flex-wrap:wrap; gap:.45rem; margin:.25rem 0 1rem 0;}}
+    .status-pill {{
+        display:inline-flex; align-items:center; gap:.35rem; padding:.34rem .62rem; border-radius:999px;
+        border:1px solid rgba(220,201,177,.13); background:rgba(255,255,255,.025);
+        color:#C8D0D8; font-size:.73rem;
+    }}
+    .status-dot {{width:6px; height:6px; border-radius:50%; background:var(--mw-blue); display:inline-block;}}
+
+    div[data-testid="stMetric"] {{
+        background: linear-gradient(180deg, rgba(20,28,36,.96), rgba(19,25,37,.90));
+        border:1px solid rgba(220,201,177,.13);
+        border-top:2px solid rgba(93,115,175,.78);
+        padding:15px 17px; border-radius:13px; min-height:104px;
+        box-shadow:0 10px 28px rgba(0,0,0,.14);
+    }}
+    div[data-testid="stMetricLabel"] {{font-size:.74rem; color:#AEB7C0; letter-spacing:.01em;}}
+    div[data-testid="stMetricValue"] {{font-size:1.34rem; color:#FFFFFF; font-weight:680;}}
+
+    [data-testid="stDataFrame"] {{border:1px solid rgba(220,201,177,.12); border-radius:12px; overflow:hidden;}}
+    [data-testid="stFileUploader"] {{
+        border:1px dashed rgba(220,201,177,.24); border-radius:12px; background:rgba(20,28,36,.44);
+    }}
+    [data-testid="stFileUploader"] section {{padding-top:.7rem; padding-bottom:.7rem;}}
+    div[data-testid="stExpander"] {{border-radius:12px; border:1px solid rgba(220,201,177,.12); background:rgba(20,28,36,.32);}}
+
+    div.stButton > button[kind="primary"] {{
+        background:var(--mw-blue) !important; color:white !important; border:1px solid rgba(255,255,255,.08) !important;
+        border-radius:10px !important; font-weight:680 !important; min-height:2.8rem;
+        box-shadow:0 9px 24px rgba(93,115,175,.22);
+    }}
+    div.stButton > button[kind="primary"]:hover {{background:#6B82C2 !important; border-color:var(--mw-sand) !important;}}
+    div[data-testid="stDownloadButton"] > button {{
+        background:var(--mw-sand) !important; color:var(--mw-navy) !important;
+        border:1px solid var(--mw-sand) !important; border-radius:10px !important;
+        font-weight:760 !important; min-height:3rem; box-shadow:0 10px 28px rgba(220,201,177,.16);
+    }}
+    div[data-testid="stDownloadButton"] > button:hover {{
+        background:#E8D9C5 !important; color:#0C1218 !important; border-color:#FFFFFF !important; transform:translateY(-1px);
+    }}
+    .stSelectbox label, .stTextInput label, .stFileUploader label {{font-size:.78rem !important; color:#B7C0C8 !important;}}
+    hr {{border-color:rgba(220,201,177,.10) !important;}}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
-<div class="mw-hero">
-  <div class="mw-kicker">M Wealth · Operações</div>
-  <div class="mw-title">Cálculo de Fee Mensal</div>
-  <div class="mw-sub">Segmentação por grupo familiar, memória de cálculo e consolidação operacional da cobrança.</div>
+<div class="mw-header">
+  <div>
+    <div class="mw-brand-row"><span class="mw-mark">M</span><span class="mw-brand">M Wealth · Operações</span></div>
+    <div class="mw-title">Calculadora de Fee</div>
+    <div class="mw-sub">Segmentação por grupo familiar, cálculo mensal e trilha operacional de cobrança.</div>
+  </div>
+  <div class="mw-version">Motor de cobrança · base 250</div>
 </div>
 """, unsafe_allow_html=True)
 
 today = date.today()
 month_names = {1:"Janeiro",2:"Fevereiro",3:"Março",4:"Abril",5:"Maio",6:"Junho",7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
-sel1, sel2, sel3, spacer = st.columns([1.0, 1.25, 3.0, 4.75])
+sel1, sel2, sel3, spacer = st.columns([1.0, 1.15, 2.7, 5.15])
 with sel1:
     year = st.selectbox("Ano", list(range(today.year-2, today.year+3)), index=2)
 with sel2:
@@ -1114,42 +1263,52 @@ if control_path is None:
     st.stop()
 
 try:
-    ctrl, fee_tables, pl_cols = read_control(control_path)
+    ctrl, fee_tables, pl_cols, segmentation_aux = read_control(control_path)
     ref_col, ref_date = choose_reference_pl_column(pl_cols, int(year), int(month))
-    registry, groups = build_fee_registry(ctrl, fee_tables, ref_col, ref_date, manual_ptax)
+    registry, groups = build_fee_registry(ctrl, fee_tables, ref_col, ref_date, manual_ptax, segmentation_aux)
 except Exception as e:
     st.error(f"Erro ao carregar a base fixa: {e}")
     st.stop()
 
 latest_pl_date = max(datetime.strptime(c[3:], "%d/%m/%Y").date() for c in pl_cols)
 accounts_count = int(ctrl["Conta_norm"].ne("").sum())
-groups_count = int(ctrl["Grupo Familiar"].where(ctrl["Grupo Familiar"].ne(""), ctrl["Cliente"]).nunique())
-total_pl = registry["PL_ref_BRL"].sum()
-fee_ann = registry["Fee_Projetado_Mensal_Ref"].sum() * 12
+groups_count = int(groups["Grupo_chave"].nunique())
+total_pl = float(groups["PL_Grupo_Ref_BRL"].sum()) if not groups.empty else 0.0
+ativore_pl = float(groups["PL_Ativore_Grupo_BRL"].sum()) if "PL_Ativore_Grupo_BRL" in groups.columns else 0.0
+fee_ann = float(registry["Fee_Projetado_Mensal_Ref"].sum() * 12)
 roa = fee_ann / total_pl if total_pl else 0
 ptax_ref = float(groups["PTAX_Referencia"].dropna().iloc[0]) if not groups.empty else 0
+ptax_source = str(groups["Fonte_PTAX"].dropna().iloc[0]) if not groups.empty else "—"
+
+st.markdown(
+    f'<div class="status-row">'
+    f'<span class="status-pill"><span class="status-dot"></span>Fechamento {ref_date:%d/%m/%Y}</span>'
+    f'<span class="status-pill"><span class="status-dot"></span>PTAX venda {ptax_ref:.4f} · {ptax_source}</span>'
+    f'<span class="status-pill"><span class="status-dot"></span>{accounts_count} contas cobradas</span>'
+    f'</div>', unsafe_allow_html=True
+)
 
 st.markdown('<div class="section-label">Visão geral</div><div class="section-title">Fotografia da segmentação</div>', unsafe_allow_html=True)
 r1, r2, r3, r4, r5 = st.columns(5)
-r1.metric("PL de referência", fmt_brl(total_pl))
-r2.metric("ROA médio contratado", fmt_pct(roa, 3))
-r3.metric("Fee mensal teórico", fmt_brl(fee_ann/12))
-r4.metric("Contas cadastradas", f"{accounts_count:,}".replace(",", "."))
-r5.metric("Grupos familiares", f"{groups_count:,}".replace(",", "."))
-st.markdown(f'<div class="small-note">Fechamento: {ref_date:%d/%m/%Y} · PTAX venda: {ptax_ref:.4f} · Último PL no Controle: {latest_pl_date:%d/%m/%Y}</div>', unsafe_allow_html=True)
+r1.metric("PL para segmentação", fmt_brl(total_pl))
+r2.metric("Fee mensal teórico", fmt_brl(fee_ann/12))
+r3.metric("ROA efetivo", fmt_pct(roa, 3))
+r4.metric("Grupos familiares", f"{groups_count:,}".replace(",", "."))
+r5.metric("PL Atívore incluído", fmt_brl(ativore_pl))
+st.markdown(f'<div class="small-note">Último PL disponível no Controle: {latest_pl_date:%d/%m/%Y} · Atívore entra somente na segmentação e não gera cobrança própria.</div>', unsafe_allow_html=True)
 
-with st.expander("Ver cadastro de fee e segmentação", expanded=False):
+with st.expander("Detalhar segmentação e taxas", expanded=False):
     st.dataframe(registry_display(registry), use_container_width=True, hide_index=True, height=420)
 
 st.markdown('<div class="section-label">Entradas</div><div class="section-title">Arquivos operacionais do mês</div>', unsafe_allow_html=True)
-st.caption("Safra, XP US e XP Global não precisam de upload: o PL mensal é lido diretamente do Controle de Clientes.")
+st.caption("Safra, XP US e XP Global são lidos diretamente do Controle. Atívore é lida da aba própria e entra somente na segmentação.")
 c1, c2, c3 = st.columns(3)
 with c1:
-    xp_file = st.file_uploader("XP — relatório com todos os dias", type=["xlsx"], key="xp")
+    xp_file = st.file_uploader("XP · relatório com todos os dias", type=["xlsx"], key="xp")
 with c2:
-    btg_files = st.file_uploader("BTG — um arquivo por dia", type=["xlsx"], accept_multiple_files=True, key="btg")
+    btg_files = st.file_uploader("BTG · um arquivo por dia", type=["xlsx"], accept_multiple_files=True, key="btg")
 with c3:
-    cs_files = st.file_uploader("Charles Schwab — um CSV por dia", type=["csv"], accept_multiple_files=True, key="cs")
+    cs_files = st.file_uploader("Charles Schwab · um CSV por dia", type=["csv"], accept_multiple_files=True, key="cs")
 
 monthly_preview = None
 try:
@@ -1159,7 +1318,8 @@ try:
 except Exception:
     monthly_preview = None
 
-if st.button("Calcular cobrança", type="primary", use_container_width=True):
+st.markdown('<div style="height:.25rem"></div>', unsafe_allow_html=True)
+if st.button("Calcular cobrança do mês", type="primary", use_container_width=True):
     parts = []
     errors = []
     if xp_file:
@@ -1206,30 +1366,33 @@ if st.button("Calcular cobrança", type="primary", use_container_width=True):
         m4.metric("XP Global incorporado", fmt_brl(xp_global_fee))
 
         st.markdown("#### Cobrança consolidada")
-        st.caption("A XP Global participa da segmentação e do cálculo mensal, mas seu fee é incorporado à conta XP Brasil do mesmo cliente para cobrança.")
+        st.caption("A XP Global permanece identificada na memória, mas seu fee é incorporado à conta XP Brasil definida para cobrança.")
         if billing.empty:
             st.info("Sem contas calculadas.")
         else:
             st.dataframe(billing_summary_display(billing), use_container_width=True, hide_index=True, height=440)
 
-        st.markdown("#### Cobertura dos arquivos diários")
-        if coverage.empty:
-            st.info("Nenhuma fonte diária carregada.")
-        else:
-            st.dataframe(coverage_display(coverage), use_container_width=True, hide_index=True)
-            if not coverage[coverage["Datas Ausentes"].ne("Nenhuma")].empty:
-                st.warning("Há datas úteis sem arquivo/posição. Confira 'Datas Ausentes' antes do fechamento.")
+        missing_count = 0 if coverage.empty else int(coverage["Datas Ausentes"].ne("Nenhuma").sum())
+        with st.expander(f"Validação operacional · {len(diagnostics)} pendência(s) de conta · {missing_count} fonte(s) com data ausente", expanded=False):
+            st.markdown("**Cobertura dos arquivos diários**")
+            if coverage.empty:
+                st.info("Nenhuma fonte diária carregada.")
+            else:
+                st.dataframe(coverage_display(coverage), use_container_width=True, hide_index=True)
+                if missing_count:
+                    st.warning("Há datas úteis sem arquivo/posição. Confira a coluna 'Datas Ausentes' antes do fechamento.")
 
-        with st.expander(f"Conferência de contas · {len(diagnostics)} pendência(s)", expanded=False):
+            st.markdown("**Conferência de contas**")
             st.caption("XP e BTG são confrontadas com o Controle. Contas extras da Charles Schwab são ignoradas automaticamente.")
             if diagnostics.empty:
                 st.success("XP e BTG sem divergências entre contas carregadas e Controle.")
             else:
-                st.dataframe(diagnostics_display(diagnostics), use_container_width=True, hide_index=True, height=380)
+                st.dataframe(diagnostics_display(diagnostics), use_container_width=True, hide_index=True, height=330)
 
         excel = export_excel(registry, groups, detail_billing, billing, int(year), int(month), ref_date)
+        st.markdown('<div class="section-label">Saída</div><div class="section-title">Relatório operacional</div>', unsafe_allow_html=True)
         st.download_button(
-            "Baixar relatório completo (.xlsx)", data=excel,
+            "Baixar relatório completo em Excel", data=excel,
             file_name=f"Fee_MWealth_{int(year)}_{int(month):02d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,

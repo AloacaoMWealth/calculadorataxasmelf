@@ -1169,8 +1169,18 @@ st.markdown(f"""
           radial-gradient(circle at 86% 0%, rgba(93,115,175,.16), transparent 29rem),
           linear-gradient(180deg, #0C1218 0%, #0F161E 100%);
     }}
-    [data-testid="stHeader"] {{ background: rgba(12,18,24,.78); }}
-    .block-container {{padding-top: 1.45rem; padding-bottom: 4rem; max-width: 1480px;}}
+    [data-testid="stHeader"] {{
+        background: rgba(12,18,24,.96) !important;
+        border-bottom: 1px solid rgba(220,201,177,.08);
+    }}
+    /* Reserva a altura real do toolbar fixo do Streamlit.
+       Evita que o cabeçalho da M Wealth fique por baixo da barra superior. */
+    [data-testid="stAppViewContainer"] .main .block-container,
+    section.main > div.block-container {{
+        padding-top: 4.75rem !important;
+        padding-bottom: 4rem !important;
+        max-width: 1480px !important;
+    }}
 
     .mw-header {{
         display:flex; align-items:flex-end; justify-content:space-between; gap:2rem;
@@ -1231,6 +1241,11 @@ st.markdown(f"""
     }}
     .stSelectbox label, .stTextInput label, .stFileUploader label {{font-size:.78rem !important; color:#B7C0C8 !important;}}
     hr {{border-color:rgba(220,201,177,.10) !important;}}
+
+    @media (max-width: 900px) {{
+        [data-testid="stAppViewContainer"] .main .block-container,
+        section.main > div.block-container {{ padding-top: 4.9rem !important; }}
+    }}
 </style>
 """, unsafe_allow_html=True)
 

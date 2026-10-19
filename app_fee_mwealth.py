@@ -24,8 +24,8 @@ from PIL import Image
 # 5) Offshore (Charles Schwab / XP US) é convertido para BRL pela PTAX.
 # ============================================================
 
-OFFSHORE_BROKERS = {"CHARLES SCHWAB", "XP US"}
-MONTHLY_FROM_CONTROL_BROKERS = {"SAFRA", "XP US"}
+OFFSHORE_BROKERS = {"CHARLES SCHWAB", "XP US", "XP GLOBAL"}
+MONTHLY_FROM_CONTROL_BROKERS = {"SAFRA", "XP US", "XP GLOBAL"}
 APP_DIR = Path(__file__).resolve().parent
 CONTROL_CANDIDATES = [
     APP_DIR / "data" / "controle_clientes.xlsx",
@@ -43,11 +43,17 @@ def norm_text(v) -> str:
 
 
 def norm_account(v) -> str:
-    """Normaliza contas removendo máscara e zeros à esquerda."""
-    s = re.sub(r"\D", "", norm_text(v))
-    if not s:
+    """Normaliza contas sem perder identificadores alfanuméricos (ex.: XP Global)."""
+    raw = norm_text(v).upper()
+    if not raw:
         return ""
-    return str(int(s))
+    # Contas alfanuméricas precisam manter as letras; remove apenas máscara/espaços.
+    if re.search(r"[A-Z]", raw):
+        return re.sub(r"[^A-Z0-9]", "", raw)
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    return str(int(digits))
 
 
 def excel_date(v) -> Optional[pd.Timestamp]:
@@ -467,7 +473,7 @@ def build_monthly_from_control(registry: pd.DataFrame, ctrl: pd.DataFrame, pl_co
                                year: int, month: int, manual_ptax: dict[date, float],
                                reference_col: Optional[str] = None,
                                reference_date: Optional[date] = None) -> tuple[pd.DataFrame, dict]:
-    """Gera cobrança mensal de Safra e XP US usando o mesmo fechamento da segmentação."""
+    """Gera cobrança mensal de Safra, XP US e XP Global usando o fechamento da segmentação."""
     if reference_col is not None and reference_date is not None:
         billing_col, billing_date = reference_col, reference_date
         month_end = (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(1)).date()
@@ -478,7 +484,7 @@ def build_monthly_from_control(registry: pd.DataFrame, ctrl: pd.DataFrame, pl_co
     base = ctrl[ctrl["Corretora"].isin(MONTHLY_FROM_CONTROL_BROKERS)].copy()
     base["PL_original"] = pd.to_numeric(base[billing_col], errors="coerce").fillna(0.0)
     base["Data"] = pd.Timestamp(billing_date)
-    base["Moeda"] = base["Corretora"].apply(lambda x: "USD" if x == "XP US" else "BRL")
+    base["Moeda"] = base["Corretora"].apply(lambda x: "USD" if x in {"XP US", "XP GLOBAL"} else "BRL")
 
     if (base["Moeda"] == "USD").any():
         ptax, ptax_date, src = ptax_with_manual(billing_date, manual_ptax)
@@ -625,6 +631,134 @@ def build_coverage(mov: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _xp_global_target_map(registry: pd.DataFrame) -> dict[tuple[str, str], str]:
+    """Mapeia cada conta XP Global para uma conta XP Brasil do mesmo cliente.
+
+    Quando houver mais de uma conta XP Brasil, usa a de maior PL de referência.
+    Isso evita direcionar a cobrança para uma conta zerada/inativa quando existe
+    outra conta local ativa para o mesmo cliente.
+    """
+    mapping: dict[tuple[str, str], str] = {}
+    global_rows = registry[registry["Corretora"].eq("XP GLOBAL")].copy()
+    for _, row in global_rows.iterrows():
+        client = norm_text(row.get("Cliente", ""))
+        source_account = norm_account(row.get("Conta_norm", ""))
+        candidates = registry[(registry["Corretora"].eq("XP")) & (registry["Cliente"].eq(client))].copy()
+        candidates = candidates[candidates["Conta_norm"].astype(str).ne("")]
+        if candidates.empty:
+            continue
+        candidates["_pl"] = pd.to_numeric(candidates["PL_ref_BRL"], errors="coerce").fillna(0.0)
+        target = candidates.sort_values(["_pl", "Conta_norm"], ascending=[False, True]).iloc[0]["Conta_norm"]
+        mapping[(client, source_account)] = str(target)
+    return mapping
+
+
+def annotate_billing_destination(detail: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
+    """Acrescenta o destino operacional da cobrança sem apagar a origem do cálculo."""
+    if detail.empty:
+        return detail.copy()
+    out = detail.copy()
+    out["Corretora_Cobranca"] = out["Corretora"]
+    out["Conta_Cobranca"] = out["Conta_norm"].astype(str)
+    out["XP_Global_Incorporado"] = False
+    out["Observacao_Cobranca"] = ""
+
+    mapping = _xp_global_target_map(registry)
+    mask = out["Corretora"].eq("XP GLOBAL")
+    for i in out.index[mask]:
+        client = norm_text(out.at[i, "Cliente"])
+        source_account = norm_account(out.at[i, "Conta_norm"])
+        target = mapping.get((client, source_account))
+        if target:
+            out.at[i, "Corretora_Cobranca"] = "XP"
+            out.at[i, "Conta_Cobranca"] = target
+            out.at[i, "XP_Global_Incorporado"] = True
+            out.at[i, "Observacao_Cobranca"] = f"Fee XP Global ({source_account}) incorporado à conta XP Brasil {target}."
+        else:
+            out.at[i, "Observacao_Cobranca"] = "XP Global sem conta XP Brasil correspondente no Controle; revisar antes da cobrança."
+    return out
+
+
+def build_billing_summary(detail: pd.DataFrame, registry: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cria o resumo operacional final, incorporando XP Global à conta XP Brasil."""
+    annotated = annotate_billing_destination(detail, registry)
+    if annotated.empty:
+        return annotated, pd.DataFrame()
+
+    # Primeiro resume cada conta de origem; assim PL diário vira PL médio e não soma dias.
+    source = (
+        annotated.groupby([
+            "Corretora", "Conta_norm", "Corretora_Cobranca", "Conta_Cobranca",
+            "Grupo_chave", "Cliente", "Fee_aa", "Regra_Fee", "Moeda",
+            "XP_Global_Incorporado", "Observacao_Cobranca"
+        ], dropna=False)
+        .agg(
+            PL_Base_Original=("PL_original", "mean"),
+            PL_Base_BRL=("PL_BRL", "mean"),
+            Fee_Origem=("Fee_Calculado", "sum"),
+        )
+        .reset_index()
+    )
+    source["PL_XP_Global_USD"] = source["PL_Base_Original"].where(source["Corretora"].eq("XP GLOBAL"), 0.0)
+    source["PL_XP_Global_BRL"] = source["PL_Base_BRL"].where(source["Corretora"].eq("XP GLOBAL"), 0.0)
+    source["PL_Local_BRL"] = source["PL_Base_BRL"].where(~source["Corretora"].eq("XP GLOBAL"), 0.0)
+    source["Fee_XP_Global"] = source["Fee_Origem"].where(source["Corretora"].eq("XP GLOBAL"), 0.0)
+    source["Fee_Local"] = source["Fee_Origem"].where(~source["Corretora"].eq("XP GLOBAL"), 0.0)
+    source["Conta_XP_Global"] = source["Conta_norm"].where(source["Corretora"].eq("XP GLOBAL"), "")
+
+    rows = []
+    keys = ["Corretora_Cobranca", "Conta_Cobranca", "Grupo_chave", "Cliente"]
+    for key, g in source.groupby(keys, dropna=False, sort=True):
+        rates = [float(x) for x in pd.to_numeric(g["Fee_aa"], errors="coerce").dropna().unique()]
+        rate = rates[0] if rates else None
+        global_accounts = sorted({str(x) for x in g["Conta_XP_Global"] if norm_text(x)})
+        fee_global = float(g["Fee_XP_Global"].sum())
+        notes = []
+        if fee_global:
+            notes.append("Fee XP Global incorporado à cobrança XP Brasil")
+        if any("sem conta XP Brasil" in str(x).lower() for x in g["Observacao_Cobranca"]):
+            notes.append("Revisar vínculo da XP Global")
+        if len(rates) > 1:
+            notes.append("Mais de uma taxa na composição")
+        rows.append({
+            "Corretora_Cobranca": key[0],
+            "Conta_Cobranca": key[1],
+            "Grupo_chave": key[2],
+            "Cliente": key[3],
+            "Fee_aa": rate,
+            "PL_Local_BRL": float(g["PL_Local_BRL"].sum()),
+            "PL_XP_Global_USD": float(g["PL_XP_Global_USD"].sum()),
+            "PL_XP_Global_BRL": float(g["PL_XP_Global_BRL"].sum()),
+            "Fee_Local": float(g["Fee_Local"].sum()),
+            "Fee_XP_Global": fee_global,
+            "Fee_Total": float(g["Fee_Origem"].sum()),
+            "Contas_XP_Global": ", ".join(global_accounts),
+            "Observacao": " · ".join(notes),
+        })
+    final = pd.DataFrame(rows).sort_values(["Corretora_Cobranca", "Cliente", "Conta_Cobranca"]).reset_index(drop=True)
+    return annotated, final
+
+
+def billing_summary_display(billing: pd.DataFrame) -> pd.DataFrame:
+    if billing.empty:
+        return billing
+    d = billing.copy()
+    out = pd.DataFrame(index=d.index)
+    out["Grupo Familiar"] = d["Grupo_chave"]
+    out["Cliente"] = d["Cliente"]
+    out["Corretora"] = d["Corretora_Cobranca"]
+    out["Conta para Cobrança"] = d["Conta_Cobranca"]
+    out["Fee a.a."] = d["Fee_aa"].map(lambda x: fmt_pct(x, 3))
+    out["PL Base Local"] = d["PL_Local_BRL"].map(fmt_brl)
+    out["PL XP Global USD"] = d["PL_XP_Global_USD"].map(lambda x: fmt_usd(x) if float(x or 0) != 0 else "—")
+    out["PL XP Global BRL"] = d["PL_XP_Global_BRL"].map(lambda x: fmt_brl(x) if float(x or 0) != 0 else "—")
+    out["Fee Local"] = d["Fee_Local"].map(fmt_brl)
+    out["Fee XP Global"] = d["Fee_XP_Global"].map(lambda x: fmt_brl(x) if float(x or 0) != 0 else "—")
+    out["Fee Total"] = d["Fee_Total"].map(fmt_brl)
+    out["Observação"] = d["Observacao"]
+    return out.reset_index(drop=True)
+
+
 def build_account_fee_summary(summary: pd.DataFrame) -> pd.DataFrame:
     if summary.empty:
         return pd.DataFrame()
@@ -746,75 +880,124 @@ def coverage_display(cov: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def _pretty_export_frames(registry, groups, detail, summary, diagnostics, coverage, account_summary):
-    reg = registry.copy().rename(columns={
-        "Grupo_chave": "Grupo Familiar (Chave)", "Conta_norm": "Conta", "Tabela Fee": "Tabela Fee",
-        "PL_ref_original": "PL Referência Original", "Moeda_ref": "Moeda", "PTAX_ref": "PTAX Referência",
-        "PL_ref_BRL": "PL Referência BRL", "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL",
-        "Participacao_no_Grupo": "Participação no Grupo", "Fee_aa": "Fee a.a.", "Regra_Fee": "Regra do Fee",
-        "Fee_Projetado_Mensal_Ref": "Fee Mensal Teórico"
-    })
-    reg["PL Referência USD"] = reg["PL Referência Original"].where(reg["Moeda"].eq("USD"))
+def _segmentacao_export(registry: pd.DataFrame) -> pd.DataFrame:
+    reg = registry.copy()
+    out = pd.DataFrame()
+    out["Grupo Familiar"] = _group_label(reg)
+    out["Cliente"] = reg["Cliente"]
+    out["Corretora"] = reg["Corretora"]
+    out["Conta"] = reg["Conta_norm"]
+    out["Tabela Fee"] = reg["Tabela Fee"]
+    out["Regra do Fee"] = reg["Regra_Fee"]
+    out["PL Referência USD"] = reg["PL_ref_original"].where(reg["Moeda_ref"].eq("USD"))
+    out["PTAX Referência"] = reg["PTAX_ref"].where(reg["Moeda_ref"].eq("USD"))
+    out["PL Referência BRL"] = reg["PL_ref_BRL"]
+    out["PL Grupo Familiar BRL"] = reg["PL_Grupo_Ref_BRL"]
+    out["Participação no Grupo"] = reg["Participacao_no_Grupo"]
+    out["Fee a.a."] = reg["Fee_aa"]
+    return out
 
-    grp = groups.copy().rename(columns={
-        "Grupo_chave": "Grupo Familiar", "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL", "Contas": "Contas",
-        "Fee_Projetado_Anual": "Fee Projetado Anual", "ROA_Contratado": "ROA Contratado",
-        "Data_Referencia": "Data de Referência", "PTAX_Referencia": "PTAX Referência",
-        "Data_PTAX_Utilizada": "Data PTAX Utilizada", "Fonte_PTAX": "Fonte PTAX"
+
+def _groups_export(groups: pd.DataFrame) -> pd.DataFrame:
+    return groups.copy().rename(columns={
+        "Grupo_chave": "Grupo Familiar",
+        "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL",
+        "Fee_Projetado_Anual": "Fee Projetado Anual",
+        "ROA_Contratado": "ROA Contratado",
+        "Data_Referencia": "Data de Referência",
+        "PTAX_Referencia": "PTAX Referência",
+        "Data_PTAX_Utilizada": "Data PTAX Utilizada",
+        "Fonte_PTAX": "Fonte PTAX",
     })
 
-    summ = summary.copy().rename(columns={
-        "Conta_norm": "Conta", "Grupo_chave": "Grupo Familiar", "Tabela Fee": "Tabela Fee", "Fee_aa": "Fee a.a.",
-        "Regra_Fee": "Regra do Fee", "Metodo": "Metodologia", "PL_Medio_Original": "PL Médio Original",
-        "PL_Fechamento_Original": "PL Fechamento Original", "PL_Medio_BRL": "PL Médio BRL",
-        "PL_Fechamento_BRL": "PL Fechamento BRL", "Dias_ou_Registros": "Dias/Registros", "Fee_Mes": "Fee do Mês",
-        "Data_Inicial": "Data Inicial", "Data_Final": "Data Final", "PL_Medio_USD": "PL Médio USD",
-        "PL_Fechamento_USD": "PL Fechamento USD", "Fee_Projetado_Anual_sobre_PL_Medio": "Fee Anual sobre PL Médio"
+
+def _billing_export(billing: pd.DataFrame) -> pd.DataFrame:
+    if billing.empty:
+        return billing.copy()
+    return billing.copy().rename(columns={
+        "Grupo_chave": "Grupo Familiar",
+        "Corretora_Cobranca": "Corretora Cobrança",
+        "Conta_Cobranca": "Conta para Cobrança",
+        "Fee_aa": "Fee a.a.",
+        "PL_Local_BRL": "PL Base Local BRL",
+        "PL_XP_Global_USD": "PL XP Global USD",
+        "PL_XP_Global_BRL": "PL XP Global BRL",
+        "Fee_Local": "Fee Local",
+        "Fee_XP_Global": "Fee XP Global",
+        "Fee_Total": "Fee Total Cobrança",
+        "Contas_XP_Global": "Conta(s) XP Global",
+        "Observacao": "Observação",
     })
 
+
+def _detail_export(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty:
+        return detail.copy()
     det = detail.copy().rename(columns={
-        "Conta_norm": "Conta", "PL_original": "PL Original", "PL_BRL": "PL BRL", "Metodo": "Metodologia",
-        "Grupo_chave": "Grupo Familiar", "Tabela Fee": "Tabela Fee", "PL_ref_BRL": "PL Referência BRL",
-        "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL", "Participacao_no_Grupo": "Participação no Grupo",
-        "Fee_aa": "Fee a.a.", "Regra_Fee": "Regra do Fee", "Fee_Calculado": "Fee Calculado"
+        "Conta_norm": "Conta Origem",
+        "PL_original": "PL Original",
+        "PL_BRL": "PL BRL",
+        "Metodo": "Metodologia",
+        "Grupo_chave": "Grupo Familiar",
+        "Tabela Fee": "Tabela Fee",
+        "PL_ref_BRL": "PL Referência BRL",
+        "PL_Grupo_Ref_BRL": "PL Grupo Familiar BRL",
+        "Participacao_no_Grupo": "Participação no Grupo",
+        "Fee_aa": "Fee a.a.",
+        "Regra_Fee": "Regra do Fee",
+        "Fee_Calculado": "Fee Calculado",
+        "Corretora_Cobranca": "Corretora Cobrança",
+        "Conta_Cobranca": "Conta para Cobrança",
+        "XP_Global_Incorporado": "XP Global Incorporado",
+        "Observacao_Cobranca": "Observação Cobrança",
     })
-    det["PL USD"] = det["PL Original"].where(det["Moeda"].eq("USD"))
+    if "Moeda" in det.columns:
+        det["PL USD"] = det["PL Original"].where(det["Moeda"].eq("USD"))
+    preferred = [
+        "Data", "Grupo Familiar", "Cliente", "Corretora", "Conta Origem", "Moeda",
+        "PL Original", "PL USD", "PTAX", "PL BRL", "Tabela Fee", "Regra do Fee",
+        "Fee a.a.", "Fee Calculado", "Corretora Cobrança", "Conta para Cobrança",
+        "XP Global Incorporado", "Observação Cobrança", "Metodologia"
+    ]
+    cols = [c for c in preferred if c in det.columns]
+    return det[cols]
 
-    acct = account_summary.copy().rename(columns={
-        "Conta_norm": "Conta", "Grupo_chave": "Grupo Familiar", "Fee_aa": "Fee a.a.", "Regra_Fee": "Regra do Fee",
-        "Fee_Total": "Fee Total", "PL_Base_BRL": "PL Base BRL"
-    })
-    return reg, grp, summ, det, diagnostics.copy(), coverage.copy(), acct
 
-
-def export_excel(registry, groups, detail, summary, diagnostics, coverage, account_summary, year, month) -> bytes:
+def export_excel(registry, groups, detail, billing, year, month, ref_date) -> bytes:
     output = io.BytesIO()
-    reg, grp, summ, det, diag, cov, acct = _pretty_export_frames(
-        registry, groups, detail, summary, diagnostics, coverage, account_summary
-    )
-    daily = det[det["Metodologia"].eq("Diário / 250")].copy() if not det.empty else pd.DataFrame()
-    monthly = det[det["Metodologia"].str.startswith("Mensal / 12", na=False)].copy() if not det.empty else pd.DataFrame()
+    seg = _segmentacao_export(registry)
+    grp = _groups_export(groups)
+    bill = _billing_export(billing)
+    det = _detail_export(detail)
+
+    ptax_ref = None
+    if not groups.empty and "PTAX_Referencia" in groups.columns:
+        vals = pd.to_numeric(groups["PTAX_Referencia"], errors="coerce").dropna()
+        if not vals.empty:
+            ptax_ref = float(vals.iloc[0])
+
+    readme = pd.DataFrame([
+        ["Período calculado", f"{month:02d}/{year}"],
+        ["Fechamento usado na segmentação", ref_date.strftime("%d/%m/%Y")],
+        ["PTAX de referência", f"{ptax_ref:.4f}" if ptax_ref is not None else "—"],
+        ["", ""],
+        ["Resumo Cobranca", "Resumo operacional para cobrança. A XP Global é incorporada à conta XP Brasil do mesmo cliente e aparece destacada em colunas próprias."],
+        ["Segmentacao", "Fotografia usada para definir a faixa de fee: PL do mês selecionado, conversão offshore pela PTAX do fechamento, participação e taxa aplicada."],
+        ["Grupos", "Consolidado por grupo familiar com PL total, quantidade de contas, ROA contratado e referência cambial."],
+        ["Memoria Calculo", "Trilha completa do cálculo por data/conta. Mantém a XP Global como origem separada e informa em qual conta XP Brasil o fee foi incorporado."],
+    ], columns=["Item / Aba", "Descrição"])
 
     datasets = {
-        "Resumo por Conta": acct,
-        "Resumo Cobranca": summ,
-        "Cadastro Fee": reg,
+        "LEIA-ME": readme,
+        "Resumo Cobranca": bill,
+        "Segmentacao": seg,
         "Grupos": grp,
-        "Cobertura Diaria": cov,
-        "Pendencias Cadastro": diag,
         "Memoria Calculo": det,
-        "Calculo Diario": daily,
-        "Calculo Mensal": monthly,
     }
-    if not det.empty:
-        for broker in sorted(det["Corretora"].dropna().unique()):
-            safe = re.sub(r"[^A-Za-z0-9 _-]", "", broker)[:22]
-            datasets[f"Calc {safe}"[:31]] = det[det["Corretora"].eq(broker)].copy()
 
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as writer:
         for sname, data in datasets.items():
-            if data is not None and not data.empty:
-                data.to_excel(writer, sheet_name=sname, index=False)
+            data.to_excel(writer, sheet_name=sname, index=False)
 
         wb = writer.book
         fmt_header = wb.add_format({"bold": True, "bg_color": "#141C24", "font_color": "#FFFFFF", "border": 0, "align": "center", "valign": "vcenter"})
@@ -823,38 +1006,49 @@ def export_excel(registry, groups, detail, summary, diagnostics, coverage, accou
         fmt_pct_x = wb.add_format({"num_format": '0.000%;[Red](0.000%);-'})
         fmt_ptax = wb.add_format({"num_format": '0.0000'})
         fmt_int = wb.add_format({"num_format": '#,##0'})
+        fmt_wrap = wb.add_format({"text_wrap": True, "valign": "top"})
 
         for sname, data in datasets.items():
-            if sname not in writer.sheets or data is None or data.empty:
-                continue
             ws = writer.sheets[sname]
             ws.hide_gridlines(2)
             ws.freeze_panes(1, 0)
             ws.set_row(0, 24, fmt_header)
-            ws.autofilter(0, 0, len(data), len(data.columns)-1)
+            if not data.empty:
+                ws.autofilter(0, 0, len(data), len(data.columns)-1)
             for i, col in enumerate(data.columns):
                 name = str(col)
                 width = 16
                 fmt = None
-                if "Cliente" in name or "Grupo Familiar" in name or "Problema" in name or "Datas Ausentes" in name:
-                    width = 30 if "Datas Ausentes" not in name else 55
+                if sname == "LEIA-ME":
+                    width = 30 if i == 0 else 95
+                    fmt = fmt_wrap
+                elif "Cliente" in name or "Grupo Familiar" in name or "Observação" in name:
+                    width = 30
                 elif "Corretora" in name or "Metodologia" in name or "Regra" in name or "Tabela" in name:
                     width = 20
-                elif "Data" in name or name == "Período":
+                elif "Data" in name:
                     width = 15
                 elif "Conta" in name:
-                    width = 15
-                if "USD" in name or ("Original" in name and "Moeda" in data.columns):
-                    fmt = fmt_usd_x if "USD" in name else None
-                if "BRL" in name or name.startswith("Fee ") or name in {"Fee Total", "Fee Calculado", "Fee do Mês", "Fee Mensal Teórico", "Fee Projetado Anual", "Fee Anual sobre PL Médio"}:
+                    width = 18
+                if "USD" in name:
+                    fmt = fmt_usd_x
+                if "BRL" in name or name.startswith("Fee ") or name in {"Fee Total Cobrança", "Fee Calculado", "Fee Projetado Anual"}:
                     fmt = fmt_brl_x
-                if "%" in name or name in {"Fee a.a.", "ROA Contratado", "Participação no Grupo", "Cobertura"}:
+                if name in {"Fee a.a.", "ROA Contratado", "Participação no Grupo"}:
                     fmt = fmt_pct_x
                 if "PTAX" in name:
                     fmt = fmt_ptax
-                if name in {"Contas", "Registros", "Dias/Registros", "Dias Encontrados", "Dias Úteis Esperados"}:
+                if name in {"Contas"}:
                     fmt = fmt_int
                 ws.set_column(i, i, width, fmt)
+
+        # Destaque visual na aba operacional.
+        if "Resumo Cobranca" in writer.sheets and not bill.empty:
+            ws = writer.sheets["Resumo Cobranca"]
+            xp_col = bill.columns.get_loc("Fee XP Global") if "Fee XP Global" in bill.columns else None
+            if xp_col is not None:
+                highlight = wb.add_format({"bg_color": "#FFF2CC", "num_format": 'R$ #,##0.00;[Red](R$ #,##0.00);-'})
+                ws.conditional_format(1, xp_col, len(bill), xp_col, {"type": "cell", "criteria": ">", "value": 0, "format": highlight})
     return output.getvalue()
 
 
@@ -865,37 +1059,53 @@ st.set_page_config(page_title="Calculadora Fee | M Wealth", page_icon=page_icon,
 
 st.markdown("""
 <style>
-    .block-container {padding-top: 2.0rem; padding-bottom: 3rem; max-width: 1500px;}
-    h1 {font-size: 2rem !important; margin-bottom: .35rem !important;}
-    h2, h3 {letter-spacing: -0.02em;}
-    div[data-testid="stMetric"] {
-        background: rgba(255,255,255,0.035);
-        border: 1px solid rgba(128,128,128,0.18);
-        padding: 14px 16px;
-        border-radius: 12px;
-        min-height: 105px;
+    .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1520px;}
+    [data-testid="stAppViewContainer"] {background: linear-gradient(180deg, rgba(93,115,175,.08) 0%, rgba(20,28,36,0) 26rem);}
+    .mw-hero {
+        padding: 1.25rem 1.4rem; border: 1px solid rgba(220,201,177,.22);
+        border-radius: 16px; margin-bottom: 1rem;
+        background: linear-gradient(135deg, rgba(20,28,36,.84), rgba(93,115,175,.16));
+        box-shadow: 0 10px 32px rgba(0,0,0,.10);
     }
-    div[data-testid="stMetricLabel"] {font-size: .82rem; opacity: .72;}
-    div[data-testid="stMetricValue"] {font-size: 1.35rem;}
-    div[data-testid="stFileUploader"] {border-radius: 12px;}
-    .small-note {font-size: .82rem; opacity: .68; margin-top: -6px;}
-    .section-gap {height: .35rem;}
-    [data-testid="stDataFrame"] {border: 1px solid rgba(128,128,128,.16); border-radius: 10px; overflow: hidden;}
+    .mw-kicker {font-size:.72rem; letter-spacing:.14em; text-transform:uppercase; opacity:.62; margin-bottom:.25rem;}
+    .mw-title {font-size:1.95rem; font-weight:700; letter-spacing:-.035em; margin:0;}
+    .mw-sub {font-size:.86rem; opacity:.66; margin-top:.28rem;}
+    h2, h3 {letter-spacing:-.025em;}
+    div[data-testid="stMetric"] {
+        background: rgba(255,255,255,.035); border:1px solid rgba(220,201,177,.16);
+        padding: 14px 16px; border-radius:14px; min-height:102px;
+        box-shadow: 0 7px 20px rgba(0,0,0,.06);
+    }
+    div[data-testid="stMetricLabel"] {font-size:.78rem; opacity:.68;}
+    div[data-testid="stMetricValue"] {font-size:1.32rem;}
+    [data-testid="stDataFrame"] {border:1px solid rgba(128,128,128,.16); border-radius:12px; overflow:hidden;}
+    [data-testid="stFileUploader"] {border-radius:12px;}
+    .small-note {font-size:.80rem; opacity:.62; margin-top:-4px;}
+    .section-label {font-size:.72rem; letter-spacing:.10em; text-transform:uppercase; opacity:.58; margin-top:.4rem;}
+    .section-title {font-size:1.35rem; font-weight:650; letter-spacing:-.025em; margin:.1rem 0 .65rem 0;}
+    div.stButton > button[kind="primary"], div.stDownloadButton > button {border-radius:10px; font-weight:600;}
+    div[data-testid="stExpander"] {border-radius:12px; border-color:rgba(128,128,128,.16);}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Cálculo de Fee Mensal — M Wealth")
+st.markdown("""
+<div class="mw-hero">
+  <div class="mw-kicker">M Wealth · Operações</div>
+  <div class="mw-title">Cálculo de Fee Mensal</div>
+  <div class="mw-sub">Segmentação por grupo familiar, memória de cálculo e consolidação operacional da cobrança.</div>
+</div>
+""", unsafe_allow_html=True)
 
 today = date.today()
 month_names = {1:"Janeiro",2:"Fevereiro",3:"Março",4:"Abril",5:"Maio",6:"Junho",7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
-sel1, sel2, sel3, spacer = st.columns([1.0, 1.25, 3.1, 4.65])
+sel1, sel2, sel3, spacer = st.columns([1.0, 1.25, 3.0, 4.75])
 with sel1:
     year = st.selectbox("Ano", list(range(today.year-2, today.year+3)), index=2)
 with sel2:
     month_name = st.selectbox("Mês", list(month_names.values()), index=today.month-1)
     month = next(k for k,v in month_names.items() if v == month_name)
 with sel3:
-    ptax_text = st.text_input("PTAX manual · opcional", placeholder="31/07/2026;5,0770")
+    ptax_text = st.text_input("PTAX manual · opcional", placeholder="30/09/2026;5,1809")
 manual_ptax = parse_manual_ptax(ptax_text)
 
 control_path = find_fixed_control_path()
@@ -917,22 +1127,22 @@ groups_count = int(ctrl["Grupo Familiar"].where(ctrl["Grupo Familiar"].ne(""), c
 total_pl = registry["PL_ref_BRL"].sum()
 fee_ann = registry["Fee_Projetado_Mensal_Ref"].sum() * 12
 roa = fee_ann / total_pl if total_pl else 0
+ptax_ref = float(groups["PTAX_Referencia"].dropna().iloc[0]) if not groups.empty else 0
 
-st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-st.subheader("Visão geral")
+st.markdown('<div class="section-label">Visão geral</div><div class="section-title">Fotografia da segmentação</div>', unsafe_allow_html=True)
 r1, r2, r3, r4, r5 = st.columns(5)
 r1.metric("PL de referência", fmt_brl(total_pl))
 r2.metric("ROA médio contratado", fmt_pct(roa, 3))
 r3.metric("Fee mensal teórico", fmt_brl(fee_ann/12))
 r4.metric("Contas cadastradas", f"{accounts_count:,}".replace(",", "."))
 r5.metric("Grupos familiares", f"{groups_count:,}".replace(",", "."))
-st.markdown(f'<div class="small-note">Fechamento usado na segmentação: {ref_date:%d/%m/%Y} · Último PL disponível no Controle: {latest_pl_date:%d/%m/%Y}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="small-note">Fechamento: {ref_date:%d/%m/%Y} · PTAX venda: {ptax_ref:.4f} · Último PL no Controle: {latest_pl_date:%d/%m/%Y}</div>', unsafe_allow_html=True)
 
-with st.expander("Cadastro de fee e segmentação", expanded=False):
+with st.expander("Ver cadastro de fee e segmentação", expanded=False):
     st.dataframe(registry_display(registry), use_container_width=True, hide_index=True, height=420)
 
-st.subheader("Arquivos operacionais do mês")
-st.caption("Safra e XP US não precisam de upload: o PL mensal é lido diretamente do Controle de Clientes.")
+st.markdown('<div class="section-label">Entradas</div><div class="section-title">Arquivos operacionais do mês</div>', unsafe_allow_html=True)
+st.caption("Safra, XP US e XP Global não precisam de upload: o PL mensal é lido diretamente do Controle de Clientes.")
 c1, c2, c3 = st.columns(3)
 with c1:
     xp_file = st.file_uploader("XP — relatório com todos os dias", type=["xlsx"], key="xp")
@@ -942,9 +1152,10 @@ with c3:
     cs_files = st.file_uploader("Charles Schwab — um CSV por dia", type=["csv"], accept_multiple_files=True, key="cs")
 
 monthly_preview = None
-monthly_meta = None
 try:
-    monthly_preview, monthly_meta = build_monthly_from_control(registry, ctrl, pl_cols, int(year), int(month), manual_ptax, ref_col, ref_date)
+    monthly_preview, monthly_meta = build_monthly_from_control(
+        registry, ctrl, pl_cols, int(year), int(month), manual_ptax, ref_col, ref_date
+    )
 except Exception:
     monthly_preview = None
 
@@ -980,78 +1191,46 @@ if st.button("Calcular cobrança", type="primary", use_container_width=True):
         diagnostics = build_match_diagnostics(mov, registry)
         coverage = build_coverage(mov[mov["Metodo"].eq("Diário / 250")].copy(), int(year), int(month))
         detail, summary = calculate_fees(mov, registry)
-        account_summary = build_account_fee_summary(summary)
+        detail_billing, billing = build_billing_summary(detail, registry)
 
-        daily_summary = summary[summary["Metodo"].eq("Diário / 250")].copy() if not summary.empty else pd.DataFrame()
-        monthly_summary = summary[summary["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not summary.empty else pd.DataFrame()
-        daily_detail = detail[detail["Metodo"].eq("Diário / 250")].copy() if not detail.empty else pd.DataFrame()
-        monthly_detail = detail[detail["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not detail.empty else pd.DataFrame()
+        st.markdown('<div class="section-label">Fechamento</div><div class="section-title">Resultado da cobrança</div>', unsafe_allow_html=True)
+        daily_detail = detail_billing[detail_billing["Metodo"].eq("Diário / 250")].copy() if not detail_billing.empty else pd.DataFrame()
+        monthly_detail = detail_billing[detail_billing["Metodo"].str.startswith("Mensal / 12", na=False)].copy() if not detail_billing.empty else pd.DataFrame()
+        xp_global_fee = detail_billing.loc[detail_billing["Corretora"].eq("XP GLOBAL"), "Fee_Calculado"].sum() if not detail_billing.empty else 0
+        total_fee = detail_billing["Fee_Calculado"].sum() if not detail_billing.empty else 0
 
-        st.subheader("Resultado da cobrança")
         m1, m2, m3, m4 = st.columns(4)
-        total_fee = detail["Fee_Calculado"].sum() if not detail.empty else 0
         m1.metric("Fee total", fmt_brl(total_fee))
-        m2.metric("Fee cálculo diário", fmt_brl(daily_detail["Fee_Calculado"].sum() if not daily_detail.empty else 0))
-        m3.metric("Fee cálculo mensal", fmt_brl(monthly_detail["Fee_Calculado"].sum() if not monthly_detail.empty else 0))
-        m4.metric("Pendências de cadastro", f"{len(diagnostics):,}".replace(",", "."))
+        m2.metric("Fee diário", fmt_brl(daily_detail["Fee_Calculado"].sum() if not daily_detail.empty else 0))
+        m3.metric("Fee mensal", fmt_brl(monthly_detail["Fee_Calculado"].sum() if not monthly_detail.empty else 0))
+        m4.metric("XP Global incorporado", fmt_brl(xp_global_fee))
 
-        st.markdown("#### Fee total por conta")
-        if account_summary.empty:
+        st.markdown("#### Cobrança consolidada")
+        st.caption("A XP Global participa da segmentação e do cálculo mensal, mas seu fee é incorporado à conta XP Brasil do mesmo cliente para cobrança.")
+        if billing.empty:
             st.info("Sem contas calculadas.")
         else:
-            acct_disp = account_summary.rename(columns={"Conta_norm":"Conta", "Grupo_chave":"Grupo Familiar", "Fee_aa":"Fee a.a.", "Regra_Fee":"Regra do Fee"}).copy()
-            acct_disp["PL Base BRL"] = acct_disp["PL_Base_BRL"].map(fmt_brl)
-            acct_disp["Fee a.a."] = acct_disp["Fee a.a."].map(lambda x: fmt_pct(x,3))
-            acct_disp["Fee Total"] = acct_disp["Fee_Total"].map(fmt_brl)
-            st.dataframe(acct_disp[["Grupo Familiar","Cliente","Corretora","Conta","Regra do Fee","Fee a.a.","PL Base BRL","Fee Total"]], use_container_width=True, hide_index=True, height=360)
+            st.dataframe(billing_summary_display(billing), use_container_width=True, hide_index=True, height=440)
 
-        tab1, tab2, tab3 = st.tabs(["Cobrança consolidada", "Cálculo diário", "Cálculo mensal"])
-        with tab1:
-            st.dataframe(summary_display(summary), use_container_width=True, hide_index=True, height=440)
-        with tab2:
-            if daily_summary.empty:
-                st.info("Nenhum arquivo diário carregado para o período.")
-            else:
-                st.dataframe(summary_display(daily_summary), use_container_width=True, hide_index=True, height=440)
-        with tab3:
-            if monthly_summary.empty:
-                st.info("Safra/XP US sem posição mensal disponível no Controle.")
-            else:
-                st.dataframe(summary_display(monthly_summary), use_container_width=True, hide_index=True, height=440)
-
-        st.subheader("Cobertura dos arquivos diários")
+        st.markdown("#### Cobertura dos arquivos diários")
         if coverage.empty:
             st.info("Nenhuma fonte diária carregada.")
         else:
             st.dataframe(coverage_display(coverage), use_container_width=True, hide_index=True)
-            missing_brokers = coverage[coverage["Datas Ausentes"].ne("Nenhuma")]
-            if not missing_brokers.empty:
-                st.warning("Há datas úteis sem arquivo/posição. Confira a coluna 'Datas Ausentes' antes do fechamento.")
+            if not coverage[coverage["Datas Ausentes"].ne("Nenhuma")].empty:
+                st.warning("Há datas úteis sem arquivo/posição. Confira 'Datas Ausentes' antes do fechamento.")
 
-        st.subheader("Conferência de contas")
-        st.caption("Charles Schwab: contas que aparecem no CS Total e não existem no Controle são ignoradas automaticamente e não viram pendência.")
-        if diagnostics.empty:
-            st.success("XP e BTG sem divergências entre contas carregadas e Controle.")
-        else:
-            st.dataframe(diagnostics_display(diagnostics), use_container_width=True, hide_index=True, height=380)
+        with st.expander(f"Conferência de contas · {len(diagnostics)} pendência(s)", expanded=False):
+            st.caption("XP e BTG são confrontadas com o Controle. Contas extras da Charles Schwab são ignoradas automaticamente.")
+            if diagnostics.empty:
+                st.success("XP e BTG sem divergências entre contas carregadas e Controle.")
+            else:
+                st.dataframe(diagnostics_display(diagnostics), use_container_width=True, hide_index=True, height=380)
 
-        excel = export_excel(registry, groups, detail, summary, diagnostics, coverage, account_summary, int(year), int(month))
+        excel = export_excel(registry, groups, detail_billing, billing, int(year), int(month), ref_date)
         st.download_button(
-            "Baixar memória completa (.xlsx)", data=excel,
+            "Baixar relatório completo (.xlsx)", data=excel,
             file_name=f"Fee_MWealth_{int(year)}_{int(month):02d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-
-        st.subheader("Downloads por corretora")
-        if not detail.empty:
-            cols = st.columns(min(4, max(1, detail["Corretora"].nunique())))
-            for i, broker in enumerate(sorted(detail["Corretora"].dropna().unique())):
-                sub = detail[detail["Corretora"].eq(broker)].copy()
-                csv_bytes = sub.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-                with cols[i % len(cols)]:
-                    st.download_button(
-                        f"Baixar — {broker}", data=csv_bytes,
-                        file_name=f"Calculo_Fee_{broker.replace(' ', '_')}_{int(year)}_{int(month):02d}.csv",
-                        mime="text/csv", key=f"dl_{broker}", use_container_width=True,
-                    )

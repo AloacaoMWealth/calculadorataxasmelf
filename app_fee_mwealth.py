@@ -1239,7 +1239,6 @@ st.markdown("""
   <div>
     <div class="mw-brand-row"><span class="mw-mark">M</span><span class="mw-brand">M Wealth · Operações</span></div>
     <div class="mw-title">Calculadora de Fee</div>
-    <div class="mw-sub">Segmentação por grupo familiar, cálculo mensal e trilha operacional de cobrança.</div>
   </div>
   <div class="mw-version">Motor de cobrança · base 250</div>
 </div>
@@ -1301,7 +1300,6 @@ with st.expander("Detalhar segmentação e taxas", expanded=False):
     st.dataframe(registry_display(registry), use_container_width=True, hide_index=True, height=420)
 
 st.markdown('<div class="section-label">Entradas</div><div class="section-title">Arquivos operacionais do mês</div>', unsafe_allow_html=True)
-st.caption("Safra, XP US e XP Global são lidos diretamente do Controle. Atívore é lida da aba própria e entra somente na segmentação.")
 c1, c2, c3 = st.columns(3)
 with c1:
     xp_file = st.file_uploader("XP · relatório com todos os dias", type=["xlsx"], key="xp")
@@ -1366,7 +1364,6 @@ if st.button("Calcular cobrança do mês", type="primary", use_container_width=T
         m4.metric("XP Global incorporado", fmt_brl(xp_global_fee))
 
         st.markdown("#### Cobrança consolidada")
-        st.caption("A XP Global permanece identificada na memória, mas seu fee é incorporado à conta XP Brasil definida para cobrança.")
         if billing.empty:
             st.info("Sem contas calculadas.")
         else:
